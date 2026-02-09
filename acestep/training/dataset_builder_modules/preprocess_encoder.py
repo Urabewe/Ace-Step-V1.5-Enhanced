@@ -11,8 +11,22 @@ def run_encoder(
     dtype,
 ):
     """Run model encoder to get hidden states and attention mask."""
-    refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=dtype)
-    refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
+    try:
+        encoder_device = next(model.encoder.parameters()).device
+    except Exception:
+        encoder_device = device
+
+    if text_hidden_states.device != encoder_device:
+        text_hidden_states = text_hidden_states.to(encoder_device)
+    if text_attention_mask.device != encoder_device:
+        text_attention_mask = text_attention_mask.to(encoder_device)
+    if lyric_hidden_states.device != encoder_device:
+        lyric_hidden_states = lyric_hidden_states.to(encoder_device)
+    if lyric_attention_mask.device != encoder_device:
+        lyric_attention_mask = lyric_attention_mask.to(encoder_device)
+
+    refer_audio_hidden = torch.zeros(1, 1, 64, device=encoder_device, dtype=dtype)
+    refer_audio_order_mask = torch.zeros(1, device=encoder_device, dtype=torch.long)
 
     with torch.no_grad():
         encoder_hidden_states, encoder_attention_mask = model.encoder(

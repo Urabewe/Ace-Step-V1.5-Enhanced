@@ -209,6 +209,30 @@ class LoRATrainer:
         self.module = None
         self.fabric = None
         self.is_training = False
+
+    def _prepare_training_model(self) -> Optional[str]:
+        """Ensure model is ready for LoRA injection/training."""
+        if self.dit_handler.model is None:
+            return "❌ Model not initialized. Please initialize the service first."
+
+        warning_msg = None
+        # torch.compile wraps the model; LoRA injection after compile is unreliable.
+        if hasattr(self.dit_handler.model, "_orig_mod"):
+            logger.warning("Model is torch.compile'd; disabling compile for LoRA training.")
+            self.dit_handler.model = self.dit_handler.model._orig_mod
+            if hasattr(self.dit_handler, "compiled"):
+                self.dit_handler.compiled = False
+            warning_msg = "⚠️ torch.compile disabled for LoRA training."
+
+        # Ensure decoder is on the training device (basic loop uses it directly).
+        try:
+            self.dit_handler.model.decoder = (
+                self.dit_handler.model.decoder.to(self.dit_handler.device).to(self.dit_handler.dtype)
+            )
+        except Exception as e:
+            logger.warning(f"Could not move decoder to device: {e}")
+
+        return warning_msg
     
     def train_from_preprocessed(
         self,
@@ -231,6 +255,10 @@ class LoRATrainer:
         self.is_training = True
         
         try:
+            warning_msg = self._prepare_training_model()
+            if warning_msg:
+                yield 0, 0.0, warning_msg
+
             # Validate tensor directory
             if not os.path.exists(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
@@ -564,6 +592,7 @@ class LoRATrainer:
         accumulation_step = 0
         accumulated_loss = 0.0
         
+        self.module.model.decoder = self.module.model.decoder.to(self.module.device).to(self.module.dtype)
         self.module.model.decoder.train()
         
         for epoch in range(self.training_config.max_epochs):

@@ -1,3 +1,6 @@
+# BETA VERSION NOT TESTED ON LINUX/MAC OR WITH OTHER PYTHON ENVIRONEMENTS!!!
+
+
 # ACE-Step 1.5
 
 An enhanced and mostly bug fixed version of Ace-Step V1.5 Gradio UI. Includes all features including new exposed paramters, QOL enhancements and the ability to pause and resume training sessions.
@@ -50,3 +53,7 @@ Linux or macOS:
 ## License
 
 MIT. See `LICENSE`.
+
+## Credits
+This software uses libraries from the [FFmpeg](https://www.ffmpeg.org/) project licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html).
+

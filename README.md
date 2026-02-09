@@ -15,10 +15,21 @@ Linux or macOS:
 - Run `install_Ace-Step_LINUX.sh` or `install_Ace-Step_MAC.sh`.
 - Start the UI with `python -m acestep.acestep_v15_pipeline`.
 
+## Enhancements in this fork
+
+- Pause/resume training with saved optimizer/scheduler state and elapsed time.
+- Autosave outputs toggle with persistent settings and date-stamped folders.
+- MP3/FLAC metadata embedded directly in files; no sidecar JSONs.
+- Source audio cache toggle to avoid redundant encoding.
+- UI responsiveness improvements when batching generations.
+- Training preprocessing progress with per-file timing and ETA.
+- Cross-platform installers that auto-detect Python/CUDA and install torch 2.9.1.
+- Optional `flash-attn` install that never blocks the main setup flow.
+
 ## Requirements
 
-- Python 3.12 (see `pyproject.toml`).
-- CUDA 12.8 on Windows/Linux for GPU builds (CPU and Apple Silicon are supported on macOS).
+- Python 3.10+ for the installers.
+- CUDA 11.8–13 on Windows/Linux for GPU builds (CPU and Apple Silicon are supported on macOS).
 
 ## Docs
 

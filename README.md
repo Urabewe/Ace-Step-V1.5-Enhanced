@@ -1,3 +1,6 @@
+# BETA VERSION NOT TESTED ON LINUX/MAC OR WITH OTHER PYTHON ENVIRONEMENTS!!!
+
+
 # ACE-Step 1.5
 
 An enhanced and mostly bug fixed version of Ace-Step V1.5 Gradio UI. Includes all features including new exposed paramters, QOL enhancements and the ability to pause and resume training sessions.

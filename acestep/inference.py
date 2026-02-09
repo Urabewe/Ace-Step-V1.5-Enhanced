@@ -9,6 +9,7 @@ backward-compatible Gradio UI support.
 import math
 import os
 import tempfile
+from datetime import datetime
 from typing import Optional, Union, List, Dict, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from loguru import logger
@@ -646,7 +647,9 @@ def generate_music(
             audio_path = None
             if audio_tensor is not None and save_dir is not None:
                 try:
-                    audio_file = os.path.join(save_dir, f"{audio_key}.{audio_format}")
+                    now = datetime.now()
+                    timestamp = f"{now:%Y-%m-%d_%H-%M-%S}_{now.microsecond // 1000:03d}"
+                    audio_file = os.path.join(save_dir, f"{timestamp}_{idx + 1:02d}.{audio_format}")
                     audio_path = audio_saver.save_audio(audio_tensor,
                                                         audio_file,
                                                         sample_rate=sample_rate,

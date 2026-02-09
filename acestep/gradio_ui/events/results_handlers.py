@@ -741,7 +741,12 @@ def generate_with_progress(
                 temp_dir = tempfile.mkdtemp(prefix="acestep_batch_")
                 temp_dir = os.path.abspath(temp_dir).replace("\\", "/")
                 save_format = audio_format
-            audio_path = os.path.join(temp_dir, f"{key}.{save_format}").replace("\\", "/")
+            now = datetime.datetime.now()
+            timestamp = f"{now:%Y-%m-%d_%H-%M-%S}_{now.microsecond // 1000:03d}"
+            audio_path = os.path.join(
+                temp_dir,
+                f"{timestamp}_{i + 1:02d}.{save_format}",
+            ).replace("\\", "/")
             sanitized_metadata = _sanitize_metadata_for_audio(audio_params)
             save_audio(
                 audio_data=audio_tensor,

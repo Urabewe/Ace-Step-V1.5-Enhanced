@@ -50,3 +50,7 @@ Linux or macOS:
 ## License
 
 MIT. See `LICENSE`.
+
+## Credits
+This software uses libraries from the [FFmpeg](https://www.ffmpeg.org/) project licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html).
+

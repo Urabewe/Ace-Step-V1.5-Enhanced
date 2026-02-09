@@ -96,7 +96,9 @@ class AceStepHandler:
         self.lora_loaded = False
         self.use_lora = False
         self.lora_scale = 1.0  # LoRA influence scale (0-1)
+        self.lora_adapter_name = None
         self._base_decoder = None  # Backup of original decoder
+        self._lora_decoder = None  # Loaded LoRA decoder (PEFT-wrapped)
     
     def get_available_checkpoints(self) -> str:
         """Return project root directory path"""
@@ -239,6 +241,16 @@ class AceStepHandler:
             )
             self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             self.model.decoder.eval()
+
+            adapter_name = None
+            if hasattr(self.model.decoder, "peft_config") and self.model.decoder.peft_config:
+                adapter_name = next(iter(self.model.decoder.peft_config.keys()))
+                if hasattr(self.model.decoder, "set_adapter"):
+                    self.model.decoder.set_adapter(adapter_name)
+            if hasattr(self.model.decoder, "enable_adapter_layers"):
+                self.model.decoder.enable_adapter_layers()
+            self.lora_adapter_name = adapter_name
+            self._lora_decoder = self.model.decoder
             
             self.lora_loaded = True
             self.use_lora = True  # Enable LoRA by default after loading
@@ -259,6 +271,8 @@ class AceStepHandler:
                     info_bits.append(f"{ratio * 100:.3f}%")
                 if lora_info.get("modules_with_lora"):
                     info_bits.append(f"modules: {len(lora_info['modules_with_lora'])}")
+                if adapter_name:
+                    info_bits.append(f"adapter: {adapter_name}")
                 info_text = ", ".join(info_bits)
             except Exception as e:
                 logger.warning(f"Could not validate LoRA params: {e}")
@@ -295,6 +309,8 @@ class AceStepHandler:
             self.lora_loaded = False
             self.use_lora = False
             self.lora_scale = 1.0  # Reset scale to default
+            self.lora_adapter_name = None
+            self._lora_decoder = None
             
             logger.info("LoRA unloaded, base decoder restored")
             return "✅ LoRA unloaded, using base model"
@@ -316,18 +332,30 @@ class AceStepHandler:
             return "❌ No LoRA adapter loaded. Please load a LoRA first."
         
         self.use_lora = use_lora
-        
-        # Use PEFT's enable/disable methods if available
-        if self.lora_loaded and hasattr(self.model.decoder, 'disable_adapter_layers'):
-            try:
-                if use_lora:
+        try:
+            import copy
+            if use_lora:
+                if self._lora_decoder is not None:
+                    self.model.decoder = self._lora_decoder
+                    self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                    self.model.decoder.eval()
+                    if hasattr(self.model.decoder, "enable_adapter_layers"):
+                        self.model.decoder.enable_adapter_layers()
+                    logger.info("LoRA adapter enabled (decoder swap)")
+                elif self.lora_loaded and hasattr(self.model.decoder, 'enable_adapter_layers'):
                     self.model.decoder.enable_adapter_layers()
                     logger.info("LoRA adapter enabled")
-                else:
+            else:
+                if self._base_decoder is not None:
+                    self.model.decoder = copy.deepcopy(self._base_decoder)
+                    self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                    self.model.decoder.eval()
+                    logger.info("LoRA adapter disabled (base decoder restored)")
+                elif self.lora_loaded and hasattr(self.model.decoder, 'disable_adapter_layers'):
                     self.model.decoder.disable_adapter_layers()
                     logger.info("LoRA adapter disabled")
-            except Exception as e:
-                logger.warning(f"Could not toggle adapter layers: {e}")
+        except Exception as e:
+            logger.warning(f"Could not toggle adapter layers: {e}")
         
         status = "enabled" if use_lora else "disabled"
         return f"✅ LoRA {status}"
@@ -355,9 +383,11 @@ class AceStepHandler:
                 logger.warning(f"Could not import PEFT LoraLayer: {e}")
                 return f"⚠️ LoRA scale set to {self.lora_scale:.2f} (partial)"
 
+            lora_layer_count = 0
             for name, module in self.model.decoder.named_modules():
                 if not isinstance(module, LoraLayer):
                     continue
+                lora_layer_count += 1
                 if hasattr(module, 'scaling'):
                     scaling = module.scaling
                     # Handle dict-style scaling (adapter_name -> value)
@@ -375,6 +405,8 @@ class AceStepHandler:
                         module.scaling = module._original_scaling * self.lora_scale
             
             logger.info(f"LoRA scale set to {self.lora_scale:.2f}")
+            if lora_layer_count == 0:
+                return f"⚠️ LoRA scale set to {self.lora_scale:.2f} (no LoRA layers found)"
             return f"✅ LoRA scale: {self.lora_scale:.2f}"
         except Exception as e:
             logger.warning(f"Could not set LoRA scale: {e}")
@@ -390,6 +422,7 @@ class AceStepHandler:
             "loaded": self.lora_loaded,
             "active": self.use_lora,
             "scale": self.lora_scale,
+            "adapter": self.lora_adapter_name,
         }
     
     def initialize_service(

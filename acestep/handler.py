@@ -140,6 +140,25 @@ class AceStepHandler:
         if self.config is None:
             return False
         return getattr(self.config, 'is_turbo', False)
+
+    def _prepare_model_for_lora(self) -> Optional[str]:
+        """Ensure the model is in a safe state for LoRA injection."""
+        if self.model is None:
+            return None
+
+        warning_msg = None
+        # torch.compile wraps the model; LoRA injection after compile is unreliable.
+        if hasattr(self.model, "_orig_mod"):
+            logger.warning("Model is torch.compile'd; disabling compile for LoRA injection.")
+            self.model = self.model._orig_mod
+            self.compiled = False
+            warning_msg = "⚠️ torch.compile disabled for LoRA. Re-init to re-enable compile."
+
+        # Keep device placement consistent with offload settings.
+        target_device = "cpu" if (self.offload_to_cpu and self.offload_dit_to_cpu) else self.device
+        self.model = self.model.to(target_device).to(self.dtype)
+        self.model.eval()
+        return warning_msg
     
     def load_lora(self, lora_path: str) -> str:
         """Load LoRA adapter into the decoder.
@@ -197,6 +216,8 @@ class AceStepHandler:
             from peft import PeftModel, PeftConfig
         except ImportError:
             return "❌ PEFT library not installed. Please install with: pip install peft"
+
+        warning_msg = self._prepare_model_for_lora()
         
         try:
             import copy
@@ -223,7 +244,30 @@ class AceStepHandler:
             self.use_lora = True  # Enable LoRA by default after loading
             
             logger.info(f"LoRA adapter loaded successfully from {lora_path}")
-            return f"✅ LoRA loaded from {lora_path}"
+            # Verify LoRA parameters are present
+            try:
+                from acestep.training.lora_utils import get_lora_info
+                lora_info = get_lora_info(self.model.decoder)
+                if not lora_info.get("has_lora"):
+                    self.lora_loaded = False
+                    self.use_lora = False
+                    logger.warning("LoRA adapter loaded but no LoRA parameters detected")
+                    return "❌ LoRA adapter loaded but no LoRA parameters detected"
+                info_bits = [f"params: {lora_info['lora_params']:,}"]
+                ratio = lora_info.get("lora_ratio")
+                if ratio is not None:
+                    info_bits.append(f"{ratio * 100:.3f}%")
+                if lora_info.get("modules_with_lora"):
+                    info_bits.append(f"modules: {len(lora_info['modules_with_lora'])}")
+                info_text = ", ".join(info_bits)
+            except Exception as e:
+                logger.warning(f"Could not validate LoRA params: {e}")
+                info_text = "params: unknown"
+
+            status_msg = f"✅ LoRA loaded from {lora_path} ({info_text})"
+            if warning_msg:
+                status_msg = f"{warning_msg}\n{status_msg}"
+            return status_msg
             
         except Exception as e:
             logger.exception("Failed to load LoRA adapter")

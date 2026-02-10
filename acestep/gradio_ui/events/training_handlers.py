@@ -635,6 +635,11 @@ def start_training(
         yield "� Model not initialized. Please initialize the service first.", "", None, training_state
         return
 
+    # Free non-DiT models for preprocessed-tensor training
+    if hasattr(dit_handler, "unload_aux_models_for_training"):
+        unload_msg = dit_handler.unload_aux_models_for_training()
+        yield unload_msg, "", None, training_state
+
     if training_source == "raw":
         if not raw_audio_dir or not raw_audio_dir.strip():
             yield "❌ Please enter a raw audio directory path", "", None, training_state

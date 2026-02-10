@@ -215,6 +215,8 @@ def check_main_model_exists(checkpoints_dir: Optional[Path] = None) -> bool:
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif not isinstance(checkpoints_dir, Path):
+        checkpoints_dir = Path(checkpoints_dir)
     
     for component in MAIN_MODEL_COMPONENTS:
         component_path = checkpoints_dir / component
@@ -236,6 +238,8 @@ def check_model_exists(model_name: str, checkpoints_dir: Optional[Path] = None) 
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif not isinstance(checkpoints_dir, Path):
+        checkpoints_dir = Path(checkpoints_dir)
     
     model_path = checkpoints_dir / model_name
     return model_path.exists()

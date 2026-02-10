@@ -1,5 +1,6 @@
 import os
 import pickle
+import tempfile
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -68,7 +69,25 @@ class ModelRunner:
         print(f"[debug]dist_port: {dist_port}")
         # Use gloo backend on Windows, nccl on Linux/other platforms
         backend = "gloo" if sys.platform == "win32" else "nccl"
-        dist.init_process_group(backend, f"tcp://127.0.0.1:{dist_port}", world_size=self.world_size, rank=rank)
+        # Only initialize torch.distributed when tensor parallelism > 1.
+        if self.world_size > 1:
+            if sys.platform == "win32":
+                # Use file store to avoid hostname/network interface resolution on Windows.
+                init_file = os.path.abspath(f"nanovllm_pg_{os.getpid()}_{dist_port}.tmp")
+                store = dist.FileStore(init_file, self.world_size)
+                dist.init_process_group(
+                    backend,
+                    store=store,
+                    world_size=self.world_size,
+                    rank=rank,
+                )
+            else:
+                dist.init_process_group(
+                    backend,
+                    f"tcp://127.0.0.1:{dist_port}",
+                    world_size=self.world_size,
+                    rank=rank,
+                )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         # Use dtype instead of deprecated torch_dtype

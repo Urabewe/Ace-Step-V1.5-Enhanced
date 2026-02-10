@@ -451,18 +451,12 @@ class LLMHandler:
             
             torch.cuda.empty_cache()
 
-            # Ensure distributed backend uses loopback on local single-GPU setups
-            if os.environ.get("MASTER_ADDR") is None:
+            # On Windows, force local loopback for vLLM to avoid gloo host errors
+            # caused by external envs (e.g., Docker/K8s).
+            if sys.platform == "win32":
                 os.environ["MASTER_ADDR"] = "127.0.0.1"
-            if os.environ.get("MASTER_PORT") is None:
-                os.environ["MASTER_PORT"] = "2333"
-            if os.environ.get("GLOO_SOCKET_IFNAME") is None:
-                if sys.platform == "win32":
-                    os.environ["GLOO_SOCKET_IFNAME"] = "Loopback Pseudo-Interface 1"
-                elif sys.platform == "darwin":
-                    os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
-                else:
-                    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+                os.environ.setdefault("MASTER_PORT", "2333")
+                os.environ.pop("GLOO_SOCKET_IFNAME", None)
             
             # Use adaptive GPU memory utilization based on model size
             gpu_memory_utilization, low_gpu_memory_mode = self.get_gpu_memory_utilization(
@@ -477,6 +471,8 @@ class LLMHandler:
             else:
                 self.max_model_len = 4096
             
+            if sys.platform == "win32":
+                enforce_eager = True
             logger.info(f"Initializing 5Hz LM with model: {model_path}, enforce_eager: {enforce_eager}, tensor_parallel_size: 1, max_model_len: {self.max_model_len}, gpu_memory_utilization: {gpu_memory_utilization:.3f}")
             start_time = time.time()
             self.llm = LLM(

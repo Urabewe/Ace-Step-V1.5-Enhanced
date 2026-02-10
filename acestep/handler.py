@@ -99,6 +99,7 @@ class AceStepHandler:
         self.lora_adapter_name = None
         self._base_decoder = None  # Backup of original decoder
         self._lora_decoder = None  # Loaded LoRA decoder (PEFT-wrapped)
+        self._aux_models_unloaded = False
     
     def get_available_checkpoints(self) -> str:
         """Return project root directory path"""
@@ -424,6 +425,21 @@ class AceStepHandler:
             "scale": self.lora_scale,
             "adapter": self.lora_adapter_name,
         }
+
+    def unload_aux_models_for_training(self) -> str:
+        """Unload non-DiT models to save memory for LoRA training."""
+        try:
+            self.vae = None
+            self.text_encoder = None
+            self.text_tokenizer = None
+            self.reward_model = None
+            self._aux_models_unloaded = True
+            self._empty_cache()
+            logger.info("Unloaded VAE/text encoder/tokenizer for training")
+            return "✅ Unloaded VAE/text encoder for training"
+        except Exception as e:
+            logger.warning(f"Failed to unload aux models: {e}")
+            return f"⚠️ Failed to unload aux models: {e}"
     
     def initialize_service(
         self,

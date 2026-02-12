@@ -250,7 +250,9 @@ class AceStepHandler:
 
     def _resolve_lokr_weights(self, path: str) -> Optional[str]:
         if os.path.isfile(path):
-            return path
+            if self._is_lokr_weights(path):
+                return path
+            return None
         if not os.path.isdir(path):
             return None
         candidate = os.path.join(path, "lokr_weights.safetensors")
@@ -264,6 +266,12 @@ class AceStepHandler:
                 continue
             if "lokr_weights.safetensors" in files:
                 return os.path.join(root, "lokr_weights.safetensors")
+            for name in files:
+                if not name.lower().endswith(".safetensors"):
+                    continue
+                candidate_path = os.path.join(root, name)
+                if self._is_lokr_weights(candidate_path):
+                    return candidate_path
         return None
 
     def _parse_lycoris_int(self, meta: Dict[str, str], *keys: str, default: int) -> int:
@@ -460,7 +468,14 @@ class AceStepHandler:
             config_file = os.path.join(path, "adapter_config.json")
             weights_file = os.path.join(path, "adapter_model.safetensors")
             bin_file = os.path.join(path, "adapter_model.bin")
-            return os.path.exists(config_file) and (os.path.exists(weights_file) or os.path.exists(bin_file))
+            if os.path.exists(config_file) and (os.path.exists(weights_file) or os.path.exists(bin_file)):
+                return True
+            if os.path.exists(config_file):
+                for name in os.listdir(path):
+                    lower = name.lower()
+                    if lower.endswith(".safetensors") or lower.endswith(".bin"):
+                        return True
+            return False
 
         def _resolve_lora_dir(path: str) -> Optional[str]:
             if os.path.isfile(path):
@@ -500,6 +515,8 @@ class AceStepHandler:
         
         try:
             import copy
+            import shutil
+            import tempfile
             # Backup base decoder if not already backed up
             if self._base_decoder is None:
                 self._base_decoder = copy.deepcopy(self.model.decoder)
@@ -508,16 +525,49 @@ class AceStepHandler:
                 # Restore base decoder before loading new LoRA
                 self.model.decoder = copy.deepcopy(self._base_decoder)
                 logger.info("Restored base decoder before loading new LoRA")
-            
-            # Load PEFT adapter
-            logger.info(f"Loading LoRA adapter from {lora_path}")
-            self.model.decoder = PeftModel.from_pretrained(
-                self.model.decoder,
-                lora_path,
-                is_trainable=False,
-            )
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
-            self.model.decoder.eval()
+
+            # Load PEFT adapter (supports renamed weights via temp adapter dir)
+            adapter_dir = lora_path
+            adapter_config = os.path.join(adapter_dir, "adapter_config.json")
+            adapter_weights = os.path.join(adapter_dir, "adapter_model.safetensors")
+            adapter_bin = os.path.join(adapter_dir, "adapter_model.bin")
+            temp_dir = None
+            if not (os.path.exists(adapter_weights) or os.path.exists(adapter_bin)):
+                candidates = []
+                for name in os.listdir(adapter_dir):
+                    lower = name.lower()
+                    if lower.endswith(".safetensors") or lower.endswith(".bin"):
+                        candidates.append(os.path.join(adapter_dir, name))
+                if os.path.isfile(lora_path) and (lora_path.lower().endswith(".safetensors") or lora_path.lower().endswith(".bin")):
+                    candidates = [lora_path]
+                candidates = [c for c in candidates if os.path.isfile(c)]
+                if not candidates:
+                    return f"❌ No LoRA weights found in {adapter_dir}"
+                if len(candidates) > 1 and not os.path.isfile(lora_path):
+                    return f"❌ Multiple LoRA weight files found in {adapter_dir}; please select one"
+
+                temp_dir = tempfile.mkdtemp(prefix="peft_lora_")
+                shutil.copy2(adapter_config, os.path.join(temp_dir, "adapter_config.json"))
+                src = candidates[0]
+                if src.lower().endswith(".bin"):
+                    dst = os.path.join(temp_dir, "adapter_model.bin")
+                else:
+                    dst = os.path.join(temp_dir, "adapter_model.safetensors")
+                shutil.copy2(src, dst)
+                adapter_dir = temp_dir
+
+            try:
+                logger.info(f"Loading LoRA adapter from {adapter_dir}")
+                self.model.decoder = PeftModel.from_pretrained(
+                    self.model.decoder,
+                    adapter_dir,
+                    is_trainable=False,
+                )
+                self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                self.model.decoder.eval()
+            finally:
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
             adapter_name = None
             if hasattr(self.model.decoder, "peft_config") and self.model.decoder.peft_config:

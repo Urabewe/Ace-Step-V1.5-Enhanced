@@ -1,6 +1,5 @@
 import os
 import pickle
-import tempfile
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -69,25 +68,7 @@ class ModelRunner:
         print(f"[debug]dist_port: {dist_port}")
         # Use gloo backend on Windows, nccl on Linux/other platforms
         backend = "gloo" if sys.platform == "win32" else "nccl"
-        # Only initialize torch.distributed when tensor parallelism > 1.
-        if self.world_size > 1:
-            if sys.platform == "win32":
-                # Use file store to avoid hostname/network interface resolution on Windows.
-                init_file = os.path.abspath(f"nanovllm_pg_{os.getpid()}_{dist_port}.tmp")
-                store = dist.FileStore(init_file, self.world_size)
-                dist.init_process_group(
-                    backend,
-                    store=store,
-                    world_size=self.world_size,
-                    rank=rank,
-                )
-            else:
-                dist.init_process_group(
-                    backend,
-                    f"tcp://127.0.0.1:{dist_port}",
-                    world_size=self.world_size,
-                    rank=rank,
-                )
+        dist.init_process_group(backend, f"tcp://127.0.0.1:{dist_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         # Use dtype instead of deprecated torch_dtype
@@ -237,6 +218,22 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        # Account for per-process memory fraction (set via MAX_CUDA_VRAM simulation)
+        import os as _os
+        _debug_vram = _os.environ.get("MAX_CUDA_VRAM")
+        if _debug_vram is not None:
+            try:
+                _simulated_gb = float(_debug_vram)
+                _total_gb = total / (1024 ** 3)
+                if _simulated_gb < _total_gb:
+                    # Effective total and free are capped by simulation
+                    reserved = torch.cuda.memory_reserved()
+                    total = int(_simulated_gb * (1024 ** 3))
+                    free = max(0, total - reserved)
+            except (ValueError, TypeError):
+                pass
+        
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
@@ -246,6 +243,13 @@ class ModelRunner:
         # Use free memory but respect the gpu_memory_utilization limit
         target_total_usage = total * config.gpu_memory_utilization
         available_for_kv_cache = min(free * 0.9, target_total_usage - current)
+        
+        # Safety check: ensure we leave at least ~1 GB free for DiT inference
+        # activations that will run after LM generation. Without this, the KV
+        # cache can consume all free VRAM and cause OOM during DiT forward pass.
+        MIN_RESERVE_BYTES = int(1.0 * 1024**3)  # 1 GB reserved for other models
+        max_kv_from_free = max(0, free - MIN_RESERVE_BYTES) * 0.9
+        available_for_kv_cache = min(available_for_kv_cache, max_kv_from_free)
         
         # Ensure we have positive memory available
         if available_for_kv_cache <= 0:
@@ -261,11 +265,21 @@ class ModelRunner:
             )
         max_tokens_capacity = config.num_kvcache_blocks * self.block_size
         kv_cache_size_gb = config.num_kvcache_blocks * block_bytes / 1024**3
+        
+        # If KV cache would leave less than 1 GB free, warn and suggest reducing max_model_len
+        post_kv_free = (free - config.num_kvcache_blocks * block_bytes) / 1024**3
+        if post_kv_free < 1.0:
+            print(
+                f"[nanovllm] WARNING: After KV cache allocation, only {post_kv_free:.2f} GB free. "
+                f"DiT inference may OOM. Consider reducing max_model_len or using CPU offload."
+            )
+        
         print(
             f"[nanovllm] KV cache allocated: {config.num_kvcache_blocks} blocks × {self.block_size} tokens = "
             f"{max_tokens_capacity} tokens capacity, {kv_cache_size_gb:.2f} GB "
             f"(free: {free / 1024**3:.2f} GB, used: {current / 1024**3:.2f} GB, "
-            f"target: {target_total_usage / 1024**3:.2f} GB, block: {block_bytes / 1024**2:.2f} MB)"
+            f"target: {target_total_usage / 1024**3:.2f} GB, block: {block_bytes / 1024**2:.2f} MB, "
+            f"post_kv_free: {post_kv_free:.2f} GB)"
         )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0

@@ -21,7 +21,8 @@ dist/
 
 # Project data
 checkpoints/
-datasets/
+datasets/*
+!datasets/.gitkeep
 
 # Logs
 *.log

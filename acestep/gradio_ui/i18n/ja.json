@@ -372,7 +372,7 @@
     "preset_medium": "中 VRAM (12-16GB)",
     "preset_high": "高 VRAM (24GB+)",
     "output_dir": "出力ディレクトリ",
-    "output_dir_info": "トレーニング済み LoRA 重みの保存先ディレクトリ",
+    "output_dir_info": "トレーニング済み LoRA 重みの保存先ディレクトリ (.safetensors)",
     "resume_from_label": "チェックポイントから再開",
     "resume_from_info": "再開するチェックポイントフォルダ（例: ./lora_output/checkpoints/epoch_150）",
     "start_training_btn": "🚀 トレーニング開始",

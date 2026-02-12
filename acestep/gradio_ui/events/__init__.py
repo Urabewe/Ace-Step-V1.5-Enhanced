@@ -73,8 +73,8 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         inputs=[generation_section["lora_path"]],
         outputs=[generation_section["lora_status"]]
     ).then(
-        # Update checkbox to enabled state after loading
-        fn=lambda: gr.update(value=True),
+        fn=lambda status: gr.update(value=str(status).startswith("✅")),
+        inputs=[generation_section["lora_status"]],
         outputs=[generation_section["use_lora_checkbox"]]
     )
     
@@ -82,9 +82,8 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         fn=dit_handler.unload_lora,
         outputs=[generation_section["lora_status"]]
     ).then(
-        # Update checkbox to disabled state after unloading
-        fn=lambda: gr.update(value=False),
-        outputs=[generation_section["use_lora_checkbox"]]
+        fn=lambda: (gr.update(value=False), gr.update(value=1.0)),
+        outputs=[generation_section["use_lora_checkbox"], generation_section["lora_scale_slider"]]
     )
     
     generation_section["use_lora_checkbox"].change(
@@ -1194,12 +1193,45 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
         inputs=[training_section["training_tensor_dir"]],
         outputs=[training_section["training_dataset_info"]]
     )
+
+    # Toggle LoRA/LoKR settings in the same box
+    def _update_adapter_fields(adapter_type):
+        is_lokr = (adapter_type == "lokr")
+        return (
+            gr.update(label="LoKR Linear Dim", visible=is_lokr),
+            gr.update(label="LoKR Linear Alpha", visible=is_lokr),
+            gr.update(visible=is_lokr),
+            gr.update(visible=is_lokr),
+            gr.update(visible=is_lokr),
+            gr.update(visible=is_lokr),
+            gr.update(visible=is_lokr),
+            gr.update(label=t("training.lora_rank"), visible=not is_lokr),
+            gr.update(label=t("training.lora_alpha"), visible=not is_lokr),
+            gr.update(label=t("training.lora_dropout"), visible=not is_lokr),
+        )
+
+    training_section["adapter_type"].change(
+        fn=_update_adapter_fields,
+        inputs=[training_section["adapter_type"]],
+        outputs=[
+            training_section["lokr_linear_dim"],
+            training_section["lokr_linear_alpha"],
+            training_section["lokr_factor"],
+            training_section["lokr_decompose_both"],
+            training_section["lokr_use_tucker"],
+            training_section["lokr_use_scalar"],
+            training_section["lokr_weight_decompose"],
+            training_section["lora_rank"],
+            training_section["lora_alpha"],
+            training_section["lora_dropout"],
+        ],
+    )
     
     # Start training from preprocessed tensors
-    def training_wrapper(tensor_dir, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, r, a, d, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts):
+    def training_wrapper(tensor_dir, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts):
         try:
             for progress, log, plot, state in train_h.start_training(
-                tensor_dir, dit_handler, llm_handler, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, r, a, d, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts
+                tensor_dir, dit_handler, llm_handler, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts
             ):
                 yield progress, log, plot, state
         except Exception as e:
@@ -1215,9 +1247,17 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
             training_section["raw_custom_tag"],
             training_section["raw_tag_position"],
             training_section["raw_auto_label"],
+            training_section["adapter_type"],
             training_section["lora_rank"],
             training_section["lora_alpha"],
             training_section["lora_dropout"],
+            training_section["lokr_linear_dim"],
+            training_section["lokr_linear_alpha"],
+            training_section["lokr_factor"],
+            training_section["lokr_decompose_both"],
+            training_section["lokr_use_tucker"],
+            training_section["lokr_use_scalar"],
+            training_section["lokr_weight_decompose"],
             training_section["learning_rate"],
             training_section["train_epochs"],
             training_section["train_batch_size"],

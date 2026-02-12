@@ -453,6 +453,13 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                     
                     with gr.Column(scale=1):
                         gr.HTML(f"<h3>⚙️ {t('training.train_section_lora')}</h3>")
+
+                        adapter_type = gr.Dropdown(
+                            choices=["lora", "lokr"],
+                            value="lora",
+                            label="Adapter Type",
+                            info="Select the adapter type for training",
+                        )
                         
                         lora_rank = gr.Slider(
                             minimum=4,
@@ -478,6 +485,49 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                             step=0.05,
                             value=0.1,
                             label=t("training.lora_dropout"),
+                        )
+
+                        lokr_linear_dim = gr.Slider(
+                            minimum=1,
+                            maximum=256,
+                            step=1,
+                            value=64,
+                            label="LoKR Linear Dim",
+                            visible=False,
+                        )
+                        lokr_linear_alpha = gr.Slider(
+                            minimum=1,
+                            maximum=512,
+                            step=1,
+                            value=128,
+                            label="LoKR Linear Alpha",
+                            visible=False,
+                        )
+                        lokr_factor = gr.Number(
+                            label="LoKR Factor (-1 = auto)",
+                            value=-1,
+                            precision=0,
+                            visible=False,
+                        )
+                        lokr_decompose_both = gr.Checkbox(
+                            label="Decompose Both",
+                            value=False,
+                            visible=False,
+                        )
+                        lokr_use_tucker = gr.Checkbox(
+                            label="Use Tucker",
+                            value=False,
+                            visible=False,
+                        )
+                        lokr_use_scalar = gr.Checkbox(
+                            label="Use Scalar",
+                            value=False,
+                            visible=False,
+                        )
+                        lokr_weight_decompose = gr.Checkbox(
+                            label="Weight Decompose (DoRA)",
+                            value=False,
+                            visible=False,
                         )
                 
                 gr.HTML(f"<hr><h3>🎛️ {t('training.train_section_params')}</h3>")
@@ -760,9 +810,17 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
         "raw_auto_label": raw_auto_label,
         "load_dataset_btn": load_dataset_btn,
         "training_dataset_info": training_dataset_info,
+        "adapter_type": adapter_type,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "lora_dropout": lora_dropout,
+        "lokr_linear_dim": lokr_linear_dim,
+        "lokr_linear_alpha": lokr_linear_alpha,
+        "lokr_factor": lokr_factor,
+        "lokr_decompose_both": lokr_decompose_both,
+        "lokr_use_tucker": lokr_use_tucker,
+        "lokr_use_scalar": lokr_use_scalar,
+        "lokr_weight_decompose": lokr_weight_decompose,
         "learning_rate": learning_rate,
         "train_epochs": train_epochs,
         "train_batch_size": train_batch_size,

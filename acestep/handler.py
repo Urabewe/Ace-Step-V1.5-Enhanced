@@ -99,6 +99,17 @@ class AceStepHandler:
         self.lora_adapter_name = None
         self._base_decoder = None  # Backup of original decoder
         self._lora_decoder = None  # Loaded LoRA decoder (PEFT-wrapped)
+        self.lokr_loaded = False
+        self._lokr_net = None
+        self._lokr_config = None
+        self._lycoris_net = None
+        self._lycoris_decoder = None
+        self._adapter_type = None
+        self._adapter_backend = None
+        self._lora_adapter_registry = {}
+        self._lora_scale_state = {}
+        self._last_lora_status = ""
+        self._suppress_next_lora_status_update = False
         self._aux_models_unloaded = False
     
     def get_available_checkpoints(self) -> str:
@@ -162,6 +173,257 @@ class AceStepHandler:
         self.model = self.model.to(target_device).to(self.dtype)
         self.model.eval()
         return warning_msg
+
+    def _reset_adapter_state(self) -> None:
+        self.lora_loaded = False
+        self.lokr_loaded = False
+        self.use_lora = False
+        self.lora_scale = 1.0
+        self.lora_adapter_name = None
+        self._lora_decoder = None
+        self._lokr_net = None
+        self._lokr_config = None
+        self._lycoris_net = None
+        self._lycoris_decoder = None
+        self._adapter_type = None
+        self._adapter_backend = None
+        self._lora_adapter_registry = {}
+        self._lora_scale_state = {}
+
+    def _build_lora_registry(self) -> None:
+        """Build deterministic registry for PEFT LoRA scaling."""
+        self._lora_adapter_registry = {}
+        self._lora_scale_state = {}
+        if not self.lora_loaded or self._lora_decoder is None:
+            return
+        try:
+            from peft.tuners.lora.layer import LoraLayer
+        except Exception:
+            return
+        for name, module in self._lora_decoder.named_modules():
+            if not isinstance(module, LoraLayer):
+                continue
+            if hasattr(module, "scaling"):
+                scaling = module.scaling
+                if isinstance(scaling, dict):
+                    self._lora_adapter_registry[name] = module
+                    self._lora_scale_state[name] = {k: v for k, v in scaling.items()}
+                elif isinstance(scaling, (int, float)):
+                    self._lora_adapter_registry[name] = module
+                    self._lora_scale_state[name] = scaling
+
+    def _is_lokr_weights(self, path: str) -> bool:
+        if not os.path.isfile(path):
+            return False
+        if path.lower().endswith(".safetensors"):
+            try:
+                from safetensors import safe_open
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    meta = f.metadata() or {}
+                algo = (meta.get("algo") or meta.get("algorithm") or "").lower()
+                if "lokr" in algo:
+                    return True
+            except Exception:
+                pass
+        filename = os.path.basename(path).lower()
+        return "lokr" in filename
+
+    def _read_safetensors_metadata(self, path: str) -> Dict[str, str]:
+        try:
+            from safetensors import safe_open
+            with safe_open(path, framework="pt", device="cpu") as f:
+                return f.metadata() or {}
+        except Exception:
+            return {}
+
+    def _is_lycoris_weights(self, path: str) -> bool:
+        if not os.path.isfile(path):
+            return False
+        if not path.lower().endswith(".safetensors"):
+            return False
+        meta = self._read_safetensors_metadata(path)
+        fmt = (meta.get("format") or "").lower()
+        algo = (meta.get("algo") or meta.get("algorithm") or "").lower()
+        if fmt == "lycoris" or algo in {"lokr", "lora", "loha"}:
+            return True
+        return False
+
+    def _resolve_lokr_weights(self, path: str) -> Optional[str]:
+        if os.path.isfile(path):
+            return path
+        if not os.path.isdir(path):
+            return None
+        candidate = os.path.join(path, "lokr_weights.safetensors")
+        if os.path.exists(candidate):
+            return candidate
+        # Look for a lokr_weights.safetensors in immediate subdirs
+        base_depth = path.count(os.sep)
+        for root, dirs, files in os.walk(path):
+            if root.count(os.sep) - base_depth > 1:
+                dirs[:] = []
+                continue
+            if "lokr_weights.safetensors" in files:
+                return os.path.join(root, "lokr_weights.safetensors")
+        return None
+
+    def _parse_lycoris_int(self, meta: Dict[str, str], *keys: str, default: int) -> int:
+        for key in keys:
+            val = meta.get(key)
+            if val is None:
+                continue
+            try:
+                return int(val)
+            except Exception:
+                continue
+        return default
+
+    def _parse_lycoris_bool(self, meta: Dict[str, str], *keys: str, default: bool) -> bool:
+        for key in keys:
+            val = meta.get(key)
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                if val.lower() in {"1", "true", "yes", "y"}:
+                    return True
+                if val.lower() in {"0", "false", "no", "n"}:
+                    return False
+        return default
+
+    def _parse_lycoris_targets(self, meta: Dict[str, str]) -> List[str]:
+        raw = meta.get("target_modules")
+        if not raw:
+            return ["q_proj", "k_proj", "v_proj", "o_proj"]
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and parsed:
+                return [str(x) for x in parsed]
+        except Exception:
+            pass
+        if isinstance(raw, str):
+            return [s.strip() for s in raw.split(",") if s.strip()]
+        return ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+    def _load_lokr_weights(self, weights_path: str) -> str:
+        try:
+            from acestep.training.lokr_utils import inject_lokr_into_dit, get_lokr_info
+            from acestep.training.configs import LoKRConfig
+        except ImportError:
+            return "❌ LyCORIS not installed. Please install with: pip install lycoris-lora"
+
+        warning_msg = self._prepare_model_for_lora()
+        try:
+            import copy
+            if self._base_decoder is None:
+                self._base_decoder = copy.deepcopy(self.model.decoder)
+            else:
+                self.model.decoder = copy.deepcopy(self._base_decoder)
+
+            # Attempt to load lokr_config from training_state.pt if present
+            lokr_config = LoKRConfig()
+            state_dir = os.path.dirname(weights_path)
+            state_path = os.path.join(state_dir, "training_state.pt")
+            if os.path.exists(state_path):
+                try:
+                    state = torch.load(state_path, map_location="cpu")
+                    cfg = state.get("lokr_config")
+                    if isinstance(cfg, dict):
+                        lokr_config = LoKRConfig(**cfg)
+                except Exception:
+                    pass
+
+            self.model, self._lokr_net, info = inject_lokr_into_dit(self.model, lokr_config)
+            self._lokr_config = lokr_config
+            self._lycoris_net = self._lokr_net
+            self._lycoris_decoder = self.model.decoder
+            self._adapter_backend = "lycoris"
+
+            # Load weights
+            try:
+                from acestep.training.lokr_utils import load_lokr_weights
+                load_lokr_weights(self._lokr_net, weights_path)
+            except Exception as e:
+                logger.warning(f"Failed to load LoKR weights: {e}")
+                return f"❌ Failed to load LoKR weights: {e}"
+
+            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+            self.model.decoder.eval()
+
+            self.lokr_loaded = True
+            self.lora_loaded = False
+            self.use_lora = True
+            self._adapter_type = "lokr"
+            self.lora_adapter_name = os.path.basename(weights_path)
+
+            info_text = f"params: {info.get('lokr_params', 0):,}"
+            status_msg = f"✅ LoKR loaded from {weights_path} ({info_text})"
+            if warning_msg:
+                status_msg = f"{warning_msg}\n{status_msg}"
+            self._last_lora_status = status_msg
+            self._suppress_next_lora_status_update = True
+            return status_msg
+        except Exception as e:
+            logger.exception("Failed to load LoKR adapter")
+            return f"❌ Failed to load LoKR: {str(e)}"
+
+    def _load_lycoris_lora(self, weights_path: str) -> str:
+        try:
+            from lycoris import create_lycoris, LycorisNetwork
+        except Exception:
+            return "❌ LyCORIS not installed. Please install with: pip install lycoris-lora"
+
+        warning_msg = self._prepare_model_for_lora()
+        try:
+            import copy
+            if self._base_decoder is None:
+                self._base_decoder = copy.deepcopy(self.model.decoder)
+            else:
+                self.model.decoder = copy.deepcopy(self._base_decoder)
+
+            meta = self._read_safetensors_metadata(weights_path)
+            linear_dim = self._parse_lycoris_int(meta, "linear_dim", "rank", "lora_dim", default=64)
+            linear_alpha = self._parse_lycoris_int(meta, "linear_alpha", "alpha", "lora_alpha", default=128)
+            target_modules = self._parse_lycoris_targets(meta)
+
+            LycorisNetwork.apply_preset({"target_name": target_modules})
+            lycoris_net = create_lycoris(
+                self.model.decoder,
+                1.0,
+                linear_dim=linear_dim,
+                linear_alpha=linear_alpha,
+                algo="lora",
+            )
+            lycoris_net.apply_to()
+
+            if not hasattr(self.model.decoder, "_lycoris_net"):
+                self.model.decoder._lycoris_net = lycoris_net
+
+            lycoris_net.load_weights(weights_path)
+
+            self._lycoris_net = lycoris_net
+            self._lycoris_decoder = self.model.decoder
+            self._adapter_backend = "lycoris"
+
+            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+            self.model.decoder.eval()
+
+            self.lora_loaded = True
+            self.lokr_loaded = False
+            self.use_lora = True
+            self._adapter_type = "lora"
+            self.lora_adapter_name = os.path.basename(weights_path)
+
+            info_text = f"linear_dim: {linear_dim}, linear_alpha: {linear_alpha}"
+            status_msg = f"✅ LyCORIS LoRA loaded from {weights_path} ({info_text})"
+            if warning_msg:
+                status_msg = f"{warning_msg}\n{status_msg}"
+            self._last_lora_status = status_msg
+            self._suppress_next_lora_status_update = True
+            return status_msg
+        except Exception as e:
+            logger.exception("Failed to load LyCORIS LoRA")
+            return f"❌ Failed to load LyCORIS LoRA: {str(e)}"
     
     def load_lora(self, lora_path: str) -> str:
         """Load LoRA adapter into the decoder.
@@ -179,6 +441,20 @@ class AceStepHandler:
             return "❌ Please provide a LoRA path."
         
         lora_path = lora_path.strip()
+
+        # LyCORIS weights support (.safetensors)
+        if os.path.isfile(lora_path) and lora_path.lower().endswith(".safetensors"):
+            if self._is_lycoris_weights(lora_path):
+                meta = self._read_safetensors_metadata(lora_path)
+                algo = (meta.get("algo") or meta.get("algorithm") or "").lower()
+                if algo == "lokr" or self._is_lokr_weights(lora_path):
+                    return self._load_lokr_weights(lora_path)
+                return self._load_lycoris_lora(lora_path)
+
+        # LoKR weights support (folder)
+        lokr_weights = self._resolve_lokr_weights(lora_path)
+        if lokr_weights:
+            return self._load_lokr_weights(lokr_weights)
 
         def _has_adapter_files(path: str) -> bool:
             config_file = os.path.join(path, "adapter_config.json")
@@ -255,6 +531,14 @@ class AceStepHandler:
             
             self.lora_loaded = True
             self.use_lora = True  # Enable LoRA by default after loading
+            self.lokr_loaded = False
+            self._lokr_net = None
+            self._lokr_config = None
+            self._lycoris_net = None
+            self._lycoris_decoder = None
+            self._adapter_type = "lora"
+            self._adapter_backend = "peft"
+            self._build_lora_registry()
             
             logger.info(f"LoRA adapter loaded successfully from {lora_path}")
             # Verify LoRA parameters are present
@@ -282,6 +566,8 @@ class AceStepHandler:
             status_msg = f"✅ LoRA loaded from {lora_path} ({info_text})"
             if warning_msg:
                 status_msg = f"{warning_msg}\n{status_msg}"
+            self._last_lora_status = status_msg
+            self._suppress_next_lora_status_update = True
             return status_msg
             
         except Exception as e:
@@ -294,8 +580,8 @@ class AceStepHandler:
         Returns:
             Status message
         """
-        if not self.lora_loaded:
-            return "⚠️ No LoRA adapter loaded."
+        if not self.lora_loaded and not self.lokr_loaded:
+            return "⚠️ No adapter loaded."
         
         if self._base_decoder is None:
             return "❌ Base decoder backup not found. Cannot restore."
@@ -307,14 +593,13 @@ class AceStepHandler:
             self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             self.model.decoder.eval()
             
-            self.lora_loaded = False
-            self.use_lora = False
-            self.lora_scale = 1.0  # Reset scale to default
-            self.lora_adapter_name = None
-            self._lora_decoder = None
+            self._reset_adapter_state()
             
-            logger.info("LoRA unloaded, base decoder restored")
-            return "✅ LoRA unloaded, using base model"
+            logger.info("Adapter unloaded, base decoder restored")
+            status_msg = "✅ Adapter unloaded, using base model"
+            self._last_lora_status = status_msg
+            self._suppress_next_lora_status_update = True
+            return status_msg
             
         except Exception as e:
             logger.exception("Failed to unload LoRA")
@@ -330,13 +615,22 @@ class AceStepHandler:
             Status message
         """
         if use_lora and not self.lora_loaded:
-            return "❌ No LoRA adapter loaded. Please load a LoRA first."
+            if not self.lokr_loaded:
+                return "❌ No adapter loaded. Please load a LoRA or LoKR first."
         
         self.use_lora = use_lora
+        if self._suppress_next_lora_status_update:
+            self._suppress_next_lora_status_update = False
+            return self._last_lora_status or "✅ LoRA updated"
         try:
             import copy
             if use_lora:
-                if self._lora_decoder is not None:
+                if self._lycoris_decoder is not None:
+                    self.model.decoder = self._lycoris_decoder
+                    self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                    self.model.decoder.eval()
+                    logger.info("LyCORIS adapter enabled")
+                elif self._lora_decoder is not None:
                     self.model.decoder = self._lora_decoder
                     self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
                     self.model.decoder.eval()
@@ -351,7 +645,7 @@ class AceStepHandler:
                     self.model.decoder = copy.deepcopy(self._base_decoder)
                     self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
                     self.model.decoder.eval()
-                    logger.info("LoRA adapter disabled (base decoder restored)")
+                    logger.info("Adapter disabled (base decoder restored)")
                 elif self.lora_loaded and hasattr(self.model.decoder, 'disable_adapter_layers'):
                     self.model.decoder.disable_adapter_layers()
                     logger.info("LoRA adapter disabled")
@@ -371,7 +665,8 @@ class AceStepHandler:
             Status message
         """
         if not self.lora_loaded:
-            return "⚠️ No LoRA loaded"
+            if not self.lokr_loaded:
+                return "⚠️ No adapter loaded"
         
         # Clamp scale to 0-2 range
         self.lora_scale = max(0.0, min(2.0, scale))
@@ -385,28 +680,43 @@ class AceStepHandler:
                 return f"⚠️ LoRA scale set to {self.lora_scale:.2f} (partial)"
 
             lora_layer_count = 0
-            for name, module in self.model.decoder.named_modules():
-                if not isinstance(module, LoraLayer):
-                    continue
-                lora_layer_count += 1
-                if hasattr(module, 'scaling'):
-                    scaling = module.scaling
-                    # Handle dict-style scaling (adapter_name -> value)
-                    if isinstance(scaling, dict):
-                        # Save original scaling on first call
-                        if not hasattr(module, '_original_scaling'):
-                            module._original_scaling = {k: v for k, v in scaling.items()}
-                        # Apply new scale
-                        for adapter_name in scaling:
-                            module.scaling[adapter_name] = module._original_scaling[adapter_name] * self.lora_scale
-                    # Handle float-style scaling (single value)
-                    elif isinstance(scaling, (int, float)):
-                        if not hasattr(module, '_original_scaling'):
-                            module._original_scaling = scaling
-                        module.scaling = module._original_scaling * self.lora_scale
+            if self._lycoris_net is not None:
+                if hasattr(self._lycoris_net, "set_multiplier"):
+                    self._lycoris_net.set_multiplier(self.lora_scale)
+                else:
+                    logger.warning("LyCORIS multiplier control not supported in this LyCORIS version")
+            else:
+                if self._lora_adapter_registry:
+                    for name, module in self._lora_adapter_registry.items():
+                        scaling = module.scaling
+                        lora_layer_count += 1
+                        if isinstance(scaling, dict):
+                            original = self._lora_scale_state.get(name, {})
+                            for adapter_name in scaling:
+                                base = original.get(adapter_name, scaling[adapter_name])
+                                module.scaling[adapter_name] = base * self.lora_scale
+                        elif isinstance(scaling, (int, float)):
+                            base = self._lora_scale_state.get(name, scaling)
+                            module.scaling = base * self.lora_scale
+                else:
+                    for name, module in self.model.decoder.named_modules():
+                        if not isinstance(module, LoraLayer):
+                            continue
+                        lora_layer_count += 1
+                        if hasattr(module, 'scaling'):
+                            scaling = module.scaling
+                            if isinstance(scaling, dict):
+                                if not hasattr(module, '_original_scaling'):
+                                    module._original_scaling = {k: v for k, v in scaling.items()}
+                                for adapter_name in scaling:
+                                    module.scaling[adapter_name] = module._original_scaling[adapter_name] * self.lora_scale
+                            elif isinstance(scaling, (int, float)):
+                                if not hasattr(module, '_original_scaling'):
+                                    module._original_scaling = scaling
+                                module.scaling = module._original_scaling * self.lora_scale
             
             logger.info(f"LoRA scale set to {self.lora_scale:.2f}")
-            if lora_layer_count == 0:
+            if lora_layer_count == 0 and self._lycoris_net is None:
                 return f"⚠️ LoRA scale set to {self.lora_scale:.2f} (no LoRA layers found)"
             return f"✅ LoRA scale: {self.lora_scale:.2f}"
         except Exception as e:
@@ -420,10 +730,12 @@ class AceStepHandler:
             Dictionary with LoRA status info
         """
         return {
-            "loaded": self.lora_loaded,
+            "loaded": self.lora_loaded or self.lokr_loaded,
             "active": self.use_lora,
             "scale": self.lora_scale,
             "adapter": self.lora_adapter_name,
+            "adapter_type": self._adapter_type,
+            "adapter_backend": self._adapter_backend,
         }
 
     def unload_aux_models_for_training(self) -> str:
@@ -481,6 +793,10 @@ class AceStepHandler:
                     device = "cpu"
 
             status_msg = ""
+
+            # Reset adapter state on re-init to avoid stale decoder references.
+            self._reset_adapter_state()
+            self._base_decoder = None
             
             self.device = device
             self.offload_to_cpu = offload_to_cpu

@@ -24,13 +24,17 @@ except ImportError:
     LIGHTNING_AVAILABLE = False
     logger.warning("Lightning Fabric not installed. Training will use basic training loop.")
 
-from acestep.training.configs import LoRAConfig, TrainingConfig
-from acestep.training.lora_utils import (
-    inject_lora_into_dit,
-    save_lora_weights,
-    save_training_checkpoint,
-    load_training_checkpoint,
-    check_peft_available,
+from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
+from acestep.training.lokr_utils import (
+    inject_lora_into_dit_lycoris,
+    inject_lokr_into_dit,
+    save_lora_weights_lycoris,
+    save_lora_training_checkpoint_lycoris,
+    load_lora_training_checkpoint_lycoris,
+    save_lokr_weights,
+    save_lokr_training_checkpoint,
+    load_lokr_training_checkpoint,
+    check_lycoris_available,
 )
 from acestep.training.data_module import PreprocessedDataModule
 
@@ -102,15 +106,16 @@ class PreprocessedLoRAModule(nn.Module):
         self.training_config = training_config
         self.device = device
         self.dtype = dtype
+        self.lycoris_net = None
         
         # Inject LoRA into the decoder only
-        if check_peft_available():
-            self.model, self.lora_info = inject_lora_into_dit(model, lora_config)
-            logger.info(f"LoRA injected: {self.lora_info['trainable_params']:,} trainable params")
+        if check_lycoris_available():
+            self.model, self.lycoris_net, self.lora_info = inject_lora_into_dit_lycoris(model, lora_config)
+            logger.info(f"LoRA injected: {self.lora_info.get('trainable_params', 0):,} trainable params")
         else:
             self.model = model
             self.lora_info = {}
-            logger.warning("PEFT not available, training without LoRA adapters")
+            logger.warning("LyCORIS not available, cannot train LoRA adapters")
         
         # Model config for flow matching
         self.config = model.config
@@ -179,6 +184,74 @@ class PreprocessedLoRAModule(nn.Module):
         
         self.training_losses.append(diffusion_loss.item())
         
+        return diffusion_loss
+
+
+class PreprocessedLoKRModule(nn.Module):
+    """LoKR Training Module using preprocessed tensors."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lokr_config: LoKRConfig,
+        training_config: TrainingConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+
+        self.lokr_config = lokr_config
+        self.training_config = training_config
+        self.device = device
+        self.dtype = dtype
+        self.lycoris_net = None
+        self.lokr_info = {}
+
+        if check_lycoris_available():
+            self.model, self.lycoris_net, self.lokr_info = inject_lokr_into_dit(model, lokr_config)
+            logger.info(f"LoKR injected: {self.lokr_info.get('trainable_params', 0):,} trainable params")
+        else:
+            self.model = model
+            self.lokr_info = {}
+            logger.warning("LyCORIS not available, cannot train LoKR adapters")
+
+        self.config = model.config
+        self.training_losses = []
+
+    def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        _device_type = self.device if isinstance(self.device, str) else self.device.type
+        _autocast_dtype = torch.float16 if _device_type == "mps" else torch.bfloat16
+
+        with torch.autocast(device_type=_device_type, dtype=_autocast_dtype):
+            target_latents = batch["target_latents"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            encoder_hidden_states = batch["encoder_hidden_states"].to(self.device)
+            encoder_attention_mask = batch["encoder_attention_mask"].to(self.device)
+            context_latents = batch["context_latents"].to(self.device)
+
+            bsz = target_latents.shape[0]
+            x1 = torch.randn_like(target_latents)
+            x0 = target_latents
+
+            t, r = sample_discrete_timestep(bsz, self.device, torch.bfloat16)
+            t_ = t.unsqueeze(-1).unsqueeze(-1)
+            xt = t_ * x1 + (1.0 - t_) * x0
+
+            decoder_outputs = self.model.decoder(
+                hidden_states=xt,
+                timestep=t,
+                timestep_r=t,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                context_latents=context_latents,
+            )
+
+            flow = x1 - x0
+            diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
+
+        diffusion_loss = diffusion_loss.float()
+        self.training_losses.append(diffusion_loss.item())
         return diffusion_loss
 
 
@@ -403,45 +476,24 @@ class LoRATrainer:
                 yield 0, 0.0, f"🔄 Loading checkpoint from {resume_from}..."
 
                 # Load checkpoint using utility function
-                checkpoint_info = load_training_checkpoint(
+                checkpoint_info = load_lora_training_checkpoint_lycoris(
                     resume_from,
+                    lycoris_net=self.module.lycoris_net,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=self.module.device,
                 )
 
-                if checkpoint_info["adapter_path"]:
-                    adapter_path = checkpoint_info["adapter_path"]
-                    adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
-                    if not os.path.exists(adapter_weights_path):
-                        adapter_weights_path = os.path.join(adapter_path, "adapter_model.bin")
+                if checkpoint_info["weights_path"]:
+                    start_epoch = checkpoint_info["epoch"]
+                    global_step = checkpoint_info["global_step"]
 
-                    if os.path.exists(adapter_weights_path):
-                        # Load adapter weights
-                        from safetensors.torch import load_file
-                        if adapter_weights_path.endswith(".safetensors"):
-                            state_dict = load_file(adapter_weights_path)
-                        else:
-                            state_dict = torch.load(adapter_weights_path, map_location=self.module.device)
-
-                        # Get the decoder (might be wrapped by Fabric)
-                        decoder = self.module.model.decoder
-                        if hasattr(decoder, '_forward_module'):
-                            decoder = decoder._forward_module
-
-                        decoder.load_state_dict(state_dict, strict=False)
-
-                        start_epoch = checkpoint_info["epoch"]
-                        global_step = checkpoint_info["global_step"]
-
-                        status_parts = [f"✅ Resumed from epoch {start_epoch}, step {global_step}"]
-                        if checkpoint_info["loaded_optimizer"]:
-                            status_parts.append("optimizer ✓")
-                        if checkpoint_info["loaded_scheduler"]:
-                            status_parts.append("scheduler ✓")
-                        yield 0, 0.0, ", ".join(status_parts)
-                    else:
-                        yield 0, 0.0, f"⚠️ Adapter weights not found in {adapter_path}"
+                    status_parts = [f"✅ Resumed from epoch {start_epoch}, step {global_step}"]
+                    if checkpoint_info["loaded_optimizer"]:
+                        status_parts.append("optimizer ✓")
+                    if checkpoint_info["loaded_scheduler"]:
+                        status_parts.append("scheduler ✓")
+                    yield 0, 0.0, ", ".join(status_parts)
                 else:
                     yield 0, 0.0, f"⚠️ No valid checkpoint found in {resume_from}"
 
@@ -475,13 +527,14 @@ class LoRATrainer:
                     extra_state = None
                     if training_state is not None and "elapsed_seconds" in training_state:
                         extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
-                    save_training_checkpoint(
-                        self.module.model,
+                    save_lora_training_checkpoint_lycoris(
+                        self.module.lycoris_net,
                         optimizer,
                         scheduler,
                         epoch + 1,
                         global_step,
                         checkpoint_dir,
+                        lora_config=self.module.lora_config,
                         extra_state=extra_state,
                     )
                     if training_state is not None:
@@ -539,20 +592,21 @@ class LoRATrainer:
                 extra_state = None
                 if training_state is not None and "elapsed_seconds" in training_state:
                     extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
-                save_training_checkpoint(
-                    self.module.model,
+                save_lora_training_checkpoint_lycoris(
+                    self.module.lycoris_net,
                     optimizer,
                     scheduler,
                     epoch + 1,
                     global_step,
                     checkpoint_dir,
+                    lora_config=self.module.lora_config,
                     extra_state=extra_state,
                 )
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
 
         # Save final model
         final_path = os.path.join(self.training_config.output_dir, "final")
-        save_lora_weights(self.module.model, final_path)
+        save_lora_weights_lycoris(self.module.lycoris_net, final_path)
         
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
         yield global_step, final_loss, f"✅ Training complete! LoRA saved to {final_path}"
@@ -610,13 +664,14 @@ class LoRATrainer:
                     extra_state = None
                     if training_state is not None and "elapsed_seconds" in training_state:
                         extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
-                    save_training_checkpoint(
-                        self.module.model,
+                    save_lora_training_checkpoint_lycoris(
+                        self.module.lycoris_net,
                         optimizer,
                         scheduler,
                         epoch + 1,
                         global_step,
                         checkpoint_dir,
+                        lora_config=self.module.lora_config,
                         extra_state=extra_state,
                     )
                     if training_state is not None:
@@ -653,14 +708,465 @@ class LoRATrainer:
             
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
-                save_lora_weights(self.module.model, checkpoint_dir)
+                save_lora_weights_lycoris(self.module.lycoris_net, checkpoint_dir)
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved"
         
         final_path = os.path.join(self.training_config.output_dir, "final")
-        save_lora_weights(self.module.model, final_path)
+        save_lora_weights_lycoris(self.module.lycoris_net, final_path)
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
         yield global_step, final_loss, f"✅ Training complete! LoRA saved to {final_path}"
     
     def stop(self):
         """Stop training."""
+        self.is_training = False
+
+
+class LoKRTrainer:
+    """High-level trainer for ACE-Step LoKR fine-tuning."""
+
+    def __init__(
+        self,
+        dit_handler,
+        lokr_config: LoKRConfig,
+        training_config: TrainingConfig,
+    ):
+        self.dit_handler = dit_handler
+        self.lokr_config = lokr_config
+        self.training_config = training_config
+
+        self.module = None
+        self.fabric = None
+        self.is_training = False
+
+    def _prepare_training_model(self) -> Optional[str]:
+        if self.dit_handler.model is None:
+            return "❌ Model not initialized. Please initialize the service first."
+        warning_msg = None
+        if hasattr(self.dit_handler.model, "_orig_mod"):
+            logger.warning("Model is torch.compile'd; disabling compile for LoKR training.")
+            self.dit_handler.model = self.dit_handler.model._orig_mod
+            if hasattr(self.dit_handler, "compiled"):
+                self.dit_handler.compiled = False
+            warning_msg = "⚠️ torch.compile disabled for LoKR training."
+        try:
+            self.dit_handler.model.decoder = (
+                self.dit_handler.model.decoder.to(self.dit_handler.device).to(self.dit_handler.dtype)
+            )
+        except Exception as e:
+            logger.warning(f"Could not move decoder to device: {e}")
+        return warning_msg
+
+    def _ensure_lokr_device(self) -> None:
+        """Move LoKR (LyCORIS) modules to the training device/dtype."""
+        if self.module is None:
+            return
+        try:
+            if getattr(self.module, "lycoris_net", None) is not None:
+                self.module.lycoris_net.to(self.dit_handler.device)
+            if getattr(self.module, "model", None) is not None:
+                self.module.model.decoder = (
+                    self.module.model.decoder.to(self.dit_handler.device).to(self.dit_handler.dtype)
+                )
+        except Exception as e:
+            logger.warning(f"Failed to move LoKR modules to device: {e}")
+
+    def train_from_preprocessed(
+        self,
+        tensor_dir: str,
+        training_state: Optional[Dict] = None,
+        resume_from: Optional[str] = None,
+    ) -> Generator[Tuple[int, float, str], None, None]:
+        self.is_training = True
+
+        try:
+            warning_msg = self._prepare_training_model()
+            if warning_msg:
+                yield 0, 0.0, warning_msg
+
+            if not os.path.exists(tensor_dir):
+                yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
+                return
+
+            if not check_lycoris_available():
+                yield 0, 0.0, "❌ LyCORIS not installed. Install lycoris-lora to train LoKR."
+                return
+
+            self.module = PreprocessedLoKRModule(
+                model=self.dit_handler.model,
+                lokr_config=self.lokr_config,
+                training_config=self.training_config,
+                device=self.dit_handler.device,
+                dtype=self.dit_handler.dtype,
+            )
+
+            data_module = PreprocessedDataModule(
+                tensor_dir=tensor_dir,
+                batch_size=self.training_config.batch_size,
+                num_workers=self.training_config.num_workers,
+                pin_memory=self.training_config.pin_memory,
+                prefetch_factor=self.training_config.prefetch_factor,
+                persistent_workers=self.training_config.persistent_workers,
+            )
+            data_module.setup('fit')
+
+            if len(data_module.train_dataset) == 0:
+                yield 0, 0.0, "❌ No valid samples found in tensor directory"
+                return
+
+            yield 0, 0.0, f"📂 Loaded {len(data_module.train_dataset)} preprocessed samples"
+
+            if LIGHTNING_AVAILABLE:
+                yield from self._train_with_fabric(data_module, training_state, resume_from=resume_from)
+            else:
+                yield from self._train_basic(data_module, training_state, resume_from=resume_from)
+
+        except Exception as e:
+            logger.exception("LoKR training failed")
+            yield 0, 0.0, f"❌ Training failed: {str(e)}"
+        finally:
+            self.is_training = False
+
+    def _train_with_fabric(
+        self,
+        data_module: PreprocessedDataModule,
+        training_state: Optional[Dict],
+        resume_from: Optional[str] = None,
+    ) -> Generator[Tuple[int, float, str], None, None]:
+        os.makedirs(self.training_config.output_dir, exist_ok=True)
+
+        precision = "bf16-mixed"
+        tb_logger = TensorBoardLogger(
+            root_dir=self.training_config.output_dir,
+            name="logs",
+        )
+
+        self.fabric = Fabric(
+            accelerator="auto",
+            devices=1,
+            precision=precision,
+            loggers=[tb_logger],
+        )
+        self.fabric.launch()
+
+        yield 0, 0.0, f"🚀 Starting training (precision: {precision})..."
+
+        train_loader = data_module.train_dataloader()
+
+        trainable_params = [p for p in self.module.model.decoder.parameters() if p.requires_grad]
+        if not trainable_params and getattr(self.module, "lycoris_net", None) is not None:
+            trainable_params = [p for p in self.module.lycoris_net.parameters() if p.requires_grad]
+        if not trainable_params:
+            yield 0, 0.0, "❌ No trainable parameters found!"
+            return
+
+        yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
+
+        optimizer = AdamW(
+            trainable_params,
+            lr=self.training_config.learning_rate,
+            weight_decay=self.training_config.weight_decay,
+        )
+
+        total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
+        warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
+
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, total_steps - warmup_steps),
+            T_mult=1,
+            eta_min=self.training_config.learning_rate * 0.01,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_steps],
+        )
+
+        self.module.model = self.module.model.to(torch.bfloat16)
+        decoder_for_setup = self.module.model.decoder
+        if hasattr(decoder_for_setup, "_forward_module"):
+            decoder_for_setup = decoder_for_setup._forward_module
+        self.module.model.decoder, optimizer = self.fabric.setup(decoder_for_setup, optimizer)
+        train_loader = self.fabric.setup_dataloaders(train_loader)
+        self._ensure_lokr_device()
+
+        # Handle resume from checkpoint
+        start_epoch = 0
+        global_step = 0
+        checkpoint_info = None
+
+        if resume_from and os.path.exists(resume_from):
+            try:
+                yield 0, 0.0, f"🔄 Loading checkpoint from {resume_from}..."
+                checkpoint_info = load_lokr_training_checkpoint(
+                    resume_from,
+                    lycoris_net=self.module.lycoris_net,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    device=self.module.device,
+                )
+                self._ensure_lokr_device()
+                if checkpoint_info.get("weights_path"):
+                    start_epoch = checkpoint_info.get("epoch", 0)
+                    global_step = checkpoint_info.get("global_step", 0)
+                    status_parts = [f"✅ Resumed from epoch {start_epoch}, step {global_step}"]
+                    if checkpoint_info.get("loaded_optimizer"):
+                        status_parts.append("optimizer ✓")
+                    if checkpoint_info.get("loaded_scheduler"):
+                        status_parts.append("scheduler ✓")
+                    yield 0, 0.0, ", ".join(status_parts)
+                else:
+                    yield 0, 0.0, f"⚠️ No valid LoKR weights found in {resume_from}"
+            except Exception as e:
+                logger.exception("Failed to load LoKR checkpoint")
+                yield 0, 0.0, f"⚠️ Failed to load checkpoint: {e}, starting fresh"
+                start_epoch = 0
+                global_step = 0
+        elif resume_from:
+            yield 0, 0.0, f"⚠️ Checkpoint path not found: {resume_from}, starting fresh"
+
+        accumulation_step = 0
+        accumulated_loss = 0.0
+
+        self.module.model.decoder.train()
+
+        for epoch in range(start_epoch, self.training_config.max_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            epoch_start_time = time.time()
+
+            for _, batch in enumerate(train_loader):
+                if training_state and training_state.get("should_stop", False):
+                    checkpoint_dir = os.path.join(
+                        self.training_config.output_dir,
+                        "checkpoints",
+                        f"paused_epoch_{epoch+1}_step_{global_step}",
+                    )
+                    extra_state = None
+                    if training_state is not None and "elapsed_seconds" in training_state:
+                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                    save_lokr_training_checkpoint(
+                        self.module.lycoris_net,
+                        optimizer,
+                        scheduler,
+                        epoch + 1,
+                        global_step,
+                        checkpoint_dir,
+                        lokr_config=self.lokr_config,
+                        extra_state=extra_state,
+                    )
+                    if training_state is not None:
+                        training_state["last_checkpoint_dir"] = checkpoint_dir
+                    avg_loss = accumulated_loss / max(accumulation_step, 1)
+                    yield global_step, avg_loss, f"⏸️ Paused. Checkpoint saved to {checkpoint_dir}"
+                    return
+
+                loss = self.module.training_step(batch)
+                loss = loss / self.training_config.gradient_accumulation_steps
+
+                self.fabric.backward(loss)
+                accumulated_loss += loss.item()
+                accumulation_step += 1
+
+                if accumulation_step >= self.training_config.gradient_accumulation_steps:
+                    self.fabric.clip_gradients(
+                        self.module.model.decoder,
+                        optimizer,
+                        max_norm=self.training_config.max_grad_norm,
+                    )
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    global_step += 1
+
+                    avg_loss = accumulated_loss / accumulation_step
+                    self.fabric.log("train/loss", avg_loss, step=global_step)
+                    self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
+
+                    if global_step % self.training_config.log_every_n_steps == 0:
+                        yield global_step, avg_loss, (
+                            f"Epoch {epoch+1}/{self.training_config.max_epochs}, "
+                            f"Step {global_step}, Loss: {avg_loss:.4f}"
+                        )
+
+                    epoch_loss += accumulated_loss
+                    num_batches += 1
+                    accumulated_loss = 0.0
+                    accumulation_step = 0
+
+            epoch_time = time.time() - epoch_start_time
+            avg_epoch_loss = epoch_loss / max(num_batches, 1)
+            self.fabric.log("train/epoch_loss", avg_epoch_loss, step=epoch + 1)
+            yield global_step, avg_epoch_loss, (
+                f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s, "
+                f"Loss: {avg_epoch_loss:.4f}"
+            )
+
+            if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
+                checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
+                save_lokr_training_checkpoint(
+                    self.module.lycoris_net,
+                    optimizer,
+                    scheduler,
+                    epoch + 1,
+                    global_step,
+                    checkpoint_dir,
+                    lokr_config=self.lokr_config,
+                )
+                yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
+
+        final_path = os.path.join(self.training_config.output_dir, "final")
+        save_lokr_weights(self.module.lycoris_net, final_path)
+        final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
+        yield global_step, final_loss, f"✅ Training complete! LoKR saved to {final_path}"
+
+    def _train_basic(
+        self,
+        data_module: PreprocessedDataModule,
+        training_state: Optional[Dict],
+        resume_from: Optional[str] = None,
+    ) -> Generator[Tuple[int, float, str], None, None]:
+        yield 0, 0.0, "🚀 Starting basic training loop..."
+
+        os.makedirs(self.training_config.output_dir, exist_ok=True)
+
+        train_loader = data_module.train_dataloader()
+
+        trainable_params = [p for p in self.module.model.decoder.parameters() if p.requires_grad]
+        if not trainable_params and getattr(self.module, "lycoris_net", None) is not None:
+            trainable_params = [p for p in self.module.lycoris_net.parameters() if p.requires_grad]
+        if not trainable_params:
+            yield 0, 0.0, "❌ No trainable parameters found!"
+            return
+
+        optimizer = AdamW(
+            trainable_params,
+            lr=self.training_config.learning_rate,
+            weight_decay=self.training_config.weight_decay,
+        )
+
+        total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
+        warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
+
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, total_steps - warmup_steps),
+            T_mult=1,
+            eta_min=self.training_config.learning_rate * 0.01,
+        )
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_steps])
+
+        global_step = 0
+        accumulation_step = 0
+        accumulated_loss = 0.0
+
+        if resume_from and os.path.exists(resume_from):
+            try:
+                yield 0, 0.0, f"🔄 Loading checkpoint from {resume_from}..."
+                checkpoint_info = load_lokr_training_checkpoint(
+                    resume_from,
+                    lycoris_net=self.module.lycoris_net,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    device=self.module.device,
+                )
+                if checkpoint_info.get("weights_path"):
+                    global_step = checkpoint_info.get("global_step", 0)
+                    yield 0, 0.0, f"✅ Resumed from step {global_step}"
+                else:
+                    yield 0, 0.0, f"⚠️ No valid LoKR weights found in {resume_from}"
+            except Exception as e:
+                logger.exception("Failed to load LoKR checkpoint")
+                yield 0, 0.0, f"⚠️ Failed to load checkpoint: {e}, starting fresh"
+        elif resume_from:
+            yield 0, 0.0, f"⚠️ Checkpoint path not found: {resume_from}, starting fresh"
+
+        self.module.model.decoder = self.module.model.decoder.to(self.module.device).to(self.module.dtype)
+        self.module.model.decoder.train()
+
+        for epoch in range(self.training_config.max_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            epoch_start_time = time.time()
+
+            for batch in train_loader:
+                if training_state and training_state.get("should_stop", False):
+                    checkpoint_dir = os.path.join(
+                        self.training_config.output_dir,
+                        "checkpoints",
+                        f"paused_epoch_{epoch+1}_step_{global_step}",
+                    )
+                    extra_state = None
+                    if training_state is not None and "elapsed_seconds" in training_state:
+                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                    save_lokr_training_checkpoint(
+                        self.module.lycoris_net,
+                        optimizer,
+                        scheduler,
+                        epoch + 1,
+                        global_step,
+                        checkpoint_dir,
+                        lokr_config=self.lokr_config,
+                        extra_state=extra_state,
+                    )
+                    if training_state is not None:
+                        training_state["last_checkpoint_dir"] = checkpoint_dir
+                    avg_loss = accumulated_loss / max(accumulation_step, 1)
+                    yield global_step, avg_loss, f"⏸️ Paused. Checkpoint saved to {checkpoint_dir}"
+                    return
+
+                loss = self.module.training_step(batch)
+                loss = loss / self.training_config.gradient_accumulation_steps
+                loss.backward()
+                accumulated_loss += loss.item()
+                accumulation_step += 1
+
+                if accumulation_step >= self.training_config.gradient_accumulation_steps:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, self.training_config.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                    if global_step % self.training_config.log_every_n_steps == 0:
+                        avg_loss = accumulated_loss / accumulation_step
+                        yield global_step, avg_loss, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss:.4f}"
+
+                    epoch_loss += accumulated_loss
+                    num_batches += 1
+                    accumulated_loss = 0.0
+                    accumulation_step = 0
+
+            epoch_time = time.time() - epoch_start_time
+            avg_epoch_loss = epoch_loss / max(num_batches, 1)
+            yield global_step, avg_epoch_loss, f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s"
+
+            if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
+                checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
+                save_lokr_training_checkpoint(
+                    self.module.lycoris_net,
+                    optimizer,
+                    scheduler,
+                    epoch + 1,
+                    global_step,
+                    checkpoint_dir,
+                    lokr_config=self.lokr_config,
+                )
+                yield global_step, avg_epoch_loss, "💾 Checkpoint saved"
+
+        final_path = os.path.join(self.training_config.output_dir, "final")
+        save_lokr_weights(self.module.lycoris_net, final_path)
+        final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
+        yield global_step, final_loss, f"✅ Training complete! LoKR saved to {final_path}"
+
+    def stop(self):
         self.is_training = False

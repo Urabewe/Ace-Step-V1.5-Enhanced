@@ -372,7 +372,7 @@
     "preset_medium": "Medium VRAM (12-16GB)",
     "preset_high": "High VRAM (24GB+)",
     "output_dir": "Output Directory",
-    "output_dir_info": "Directory to save trained LoRA weights",
+    "output_dir_info": "Directory to save trained LoRA weights (.safetensors)",
     "resume_from_label": "Resume From Checkpoint",
     "resume_from_info": "Checkpoint folder to resume (e.g., ./lora_output/checkpoints/epoch_150)",
     "start_training_btn": "🚀 Start Training",

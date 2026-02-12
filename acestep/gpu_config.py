@@ -269,6 +269,12 @@ def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tupl
         Tuple of (gpu_memory_utilization_ratio, target_memory_gb)
     """
     model_size = get_lm_model_size(model_path)
+
+    # Optionally base LM allocation on free VRAM (config-only).
+    if os.environ.get("ACE_LM_USE_FREE_VRAM") == "1":
+        free_gb = get_effective_free_vram_gb()
+        if free_gb > 0:
+            total_gpu_memory_gb = min(total_gpu_memory_gb, free_gb)
     
     # Target memory allocation for each model size
     target_memory = {
@@ -288,6 +294,26 @@ def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tupl
         ratio = min(0.9, max(0.1, target_gb / total_gpu_memory_gb))
     
     return ratio, target_gb
+
+
+def get_effective_free_vram_gb() -> float:
+    """Return effective free VRAM in GB (best-effort)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_bytes, _total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            debug_vram = os.environ.get(DEBUG_MAX_CUDA_VRAM_ENV)
+            if debug_vram is not None:
+                try:
+                    simulated_gb = float(debug_vram)
+                    free_gb = min(free_gb, simulated_gb)
+                except ValueError:
+                    pass
+            return free_gb
+    except Exception as e:
+        logger.warning(f"Failed to query free VRAM: {e}")
+    return 0.0
 
 
 def check_duration_limit(

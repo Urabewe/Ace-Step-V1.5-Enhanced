@@ -368,7 +368,7 @@
     "preset_medium": "中等显存 (12-16GB)",
     "preset_high": "高显存 (24GB+)",
     "output_dir": "输出目录",
-    "output_dir_info": "保存训练后 LoRA 权重的目录",
+    "output_dir_info": "保存训练后 LoRA 权重的目录 (.safetensors)",
     "resume_from_label": "从检查点继续",
     "resume_from_info": "恢复训练的检查点文件夹（例如 ./lora_output/checkpoints/epoch_150）",
     "start_training_btn": "🚀 开始训练",

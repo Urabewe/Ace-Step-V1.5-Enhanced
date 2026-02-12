@@ -601,9 +601,17 @@ def start_training(
     raw_custom_tag: str,
     raw_tag_position: str,
     raw_auto_label: bool,
+    adapter_type: str,
     lora_rank: int,
     lora_alpha: int,
     lora_dropout: float,
+    lokr_linear_dim: int,
+    lokr_linear_alpha: int,
+    lokr_factor: int,
+    lokr_decompose_both: bool,
+    lokr_use_tucker: bool,
+    lokr_use_scalar: bool,
+    lokr_weight_decompose: bool,
     learning_rate: float,
     train_epochs: int,
     train_batch_size: int,
@@ -713,28 +721,42 @@ def start_training(
         yield f"� Tensor directory not found: {tensor_dir}", "", None, training_state
         return
     
+    adapter_type = (adapter_type or "lora").strip().lower()
+    if adapter_type not in {"lora", "lokr"}:
+        yield f"❌ Unsupported adapter type: {adapter_type}", "", None, training_state
+        return
+
+    if adapter_type == "lokr":
+        try:
+            lokr_linear_dim = int(lokr_linear_dim)
+            lokr_linear_alpha = int(lokr_linear_alpha)
+            lokr_factor = int(lokr_factor)
+        except Exception:
+            yield "❌ Invalid LoKR parameters. Please check LoKR settings.", "", None, training_state
+            return
+
     # Check for required training dependencies
     try:
         from lightning.fabric import Fabric
-        from peft import get_peft_model, LoraConfig
     except ImportError as e:
-        yield f"� Missing required packages: {e}\nPlease install: pip install peft lightning", "", None, training_state
+        yield f"� Missing required packages: {e}\nPlease install: pip install lightning", "", None, training_state
+        return
+
+    try:
+        from acestep.training.lokr_utils import check_lycoris_available
+    except ImportError as e:
+        yield f"❌ Missing required packages: {e}\nPlease install: pip install lycoris-lora", "", None, training_state
+        return
+    if not check_lycoris_available():
+        yield "❌ LyCORIS not installed. Please install: pip install lycoris-lora", "", None, training_state
         return
     
     training_state["is_training"] = True
     training_state["should_stop"] = False
     
     try:
-        from acestep.training.trainer import LoRATrainer
-        from acestep.training.configs import LoRAConfig as LoRAConfigClass, TrainingConfig
-        
-        # Create configs
-        lora_config = LoRAConfigClass(
-            r=lora_rank,
-            alpha=lora_alpha,
-            dropout=lora_dropout,
-        )
-        
+        from acestep.training.configs import TrainingConfig
+
         training_config = TrainingConfig(
             shift=training_shift,
             learning_rate=learning_rate,
@@ -752,6 +774,36 @@ def start_training(
             allow_tf32=allow_tf32,
             compile_decoder=compile_training,
         )
+        if adapter_type == "lokr":
+            from acestep.training.trainer import LoKRTrainer
+            from acestep.training.configs import LoKRConfig as LoKRConfigClass
+            lokr_config = LoKRConfigClass(
+                linear_dim=lokr_linear_dim,
+                linear_alpha=lokr_linear_alpha,
+                factor=lokr_factor,
+                decompose_both=lokr_decompose_both,
+                use_tucker=lokr_use_tucker,
+                use_scalar=lokr_use_scalar,
+                weight_decompose=lokr_weight_decompose,
+            )
+            trainer = LoKRTrainer(
+                dit_handler=dit_handler,
+                lokr_config=lokr_config,
+                training_config=training_config,
+            )
+        else:
+            from acestep.training.trainer import LoRATrainer
+            from acestep.training.configs import LoRAConfig as LoRAConfigClass
+            lora_config = LoRAConfigClass(
+                r=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            trainer = LoRATrainer(
+                dit_handler=dit_handler,
+                lora_config=lora_config,
+                training_config=training_config,
+            )
 
         try:
             if matmul_precision:
@@ -772,8 +824,12 @@ def start_training(
         base_elapsed_seconds = 0.0
         if resume_from:
             try:
-                from acestep.training.lora_utils import load_training_checkpoint
-                checkpoint_info = load_training_checkpoint(resume_from)
+                if adapter_type == "lokr":
+                    from acestep.training.lokr_utils import load_lokr_training_checkpoint
+                    checkpoint_info = load_lokr_training_checkpoint(resume_from)
+                else:
+                    from acestep.training.lora_utils import load_training_checkpoint
+                    checkpoint_info = load_training_checkpoint(resume_from)
                 base_elapsed_seconds = float(checkpoint_info.get("elapsed_seconds", 0.0))
             except Exception as e:
                 logger.warning(f"Failed to load elapsed time from checkpoint: {e}")
@@ -783,12 +839,7 @@ def start_training(
         
         yield f"� Starting training from {tensor_dir}...", "", loss_data, training_state
         
-        # Create trainer
-        trainer = LoRATrainer(
-            dit_handler=dit_handler,
-            lora_config=lora_config,
-            training_config=training_config,
-        )
+        # Trainer already created above based on adapter_type
         
         # Collect loss history
         step_list = []
@@ -908,17 +959,42 @@ def export_lora(
     
     try:
         import shutil
-        
+
         export_path = export_path.strip()
+
+        source_is_file = os.path.isfile(source_path)
+        if not source_is_file:
+            lora_file = os.path.join(source_path, "lora_weights.safetensors")
+            if os.path.exists(lora_file):
+                source_path = lora_file
+                source_is_file = True
+
+        if source_is_file:
+            if export_path.lower().endswith(".safetensors"):
+                target_path = export_path
+                os.makedirs(os.path.dirname(target_path) if os.path.dirname(target_path) else ".", exist_ok=True)
+            else:
+                if os.path.splitext(export_path)[1]:
+                    target_path = export_path
+                    os.makedirs(os.path.dirname(target_path) if os.path.dirname(target_path) else ".", exist_ok=True)
+                else:
+                    os.makedirs(export_path if export_path else ".", exist_ok=True)
+                    target_path = os.path.join(export_path, os.path.basename(source_path))
+
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            shutil.copy2(source_path, target_path)
+            return f"� LoRA exported to {target_path}"
+
         os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
-        
+
         if os.path.exists(export_path):
             shutil.rmtree(export_path)
-        
+
         shutil.copytree(source_path, export_path)
-        
+
         return f"� LoRA exported to {export_path}"
-        
+
     except Exception as e:
         logger.exception("Export error")
         return f"� Export failed: {str(e)}"

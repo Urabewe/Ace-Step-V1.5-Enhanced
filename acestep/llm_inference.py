@@ -22,7 +22,13 @@ from transformers.generation.logits_process import (
 )
 from acestep.constrained_logits_processor import MetadataConstrainedLogitsProcessor
 from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION
-from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
+from acestep.gpu_config import (
+    get_lm_gpu_memory_ratio,
+    get_gpu_memory_gb,
+    get_lm_model_size,
+    get_global_gpu_config,
+    get_effective_free_vram_gb,
+)
 
 
 class LLMHandler:
@@ -54,6 +60,29 @@ class LLMHandler:
 
         # Shared HuggingFace model for perplexity calculation
         self._hf_model_for_scoring = None
+
+    def _teardown_llm(self, reason: str = "") -> None:
+        """Release LM resources to avoid GPU memory growth."""
+        if self.llm is None and self.llm_tokenizer is None and self.constrained_processor is None:
+            return
+        if reason:
+            logger.info(f"Tearing down 5Hz LM ({reason})")
+        try:
+            if hasattr(self.llm, "shutdown"):
+                try:
+                    self.llm.shutdown()
+                except Exception:
+                    pass
+            self.llm = None
+            self.llm_tokenizer = None
+            self.constrained_processor = None
+            self.llm_backend = None
+            self.llm_initialized = False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception as e:
+            logger.warning(f"Failed to teardown LM cleanly: {e}")
 
     def _get_checkpoint_dir(self) -> str:
         """Get checkpoint directory, prioritizing persistent storage"""
@@ -366,6 +395,9 @@ class LLMHandler:
             else:
                 self.dtype = dtype
 
+            if self.llm_initialized or self.llm is not None:
+                self._teardown_llm("reinitialize")
+
             # If lm_model_path is None, use default
             if lm_model_path is None:
                 lm_model_path = "acestep-5Hz-lm-1.7B"
@@ -438,6 +470,12 @@ class LLMHandler:
             self.llm_initialized = False
             logger.error("CUDA/ROCm is not available. Please check your GPU setup.")
             return "❌ CUDA/ROCm is not available. Please check your GPU setup."
+        # On Windows, force local loopback for vLLM to avoid gloo host errors
+        # caused by external envs (e.g., Docker/K8s).
+        if sys.platform == "win32":
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ.setdefault("MASTER_PORT", "2333")
+
         try:
             from nanovllm import LLM, SamplingParams
         except ImportError:
@@ -450,13 +488,6 @@ class LLMHandler:
             device_name = torch.cuda.get_device_name(current_device)
             
             torch.cuda.empty_cache()
-
-            # On Windows, force local loopback for vLLM to avoid gloo host errors
-            # caused by external envs (e.g., Docker/K8s).
-            if sys.platform == "win32":
-                os.environ["MASTER_ADDR"] = "127.0.0.1"
-                os.environ.setdefault("MASTER_PORT", "2333")
-                os.environ.pop("GLOO_SOCKET_IFNAME", None)
             
             # Use adaptive GPU memory utilization based on model size
             gpu_memory_utilization, low_gpu_memory_mode = self.get_gpu_memory_utilization(
@@ -465,11 +496,28 @@ class LLMHandler:
                 min_ratio=0.1,
                 max_ratio=0.9
             )
+
+            total_gb = get_gpu_memory_gb()
+            free_gb = get_effective_free_vram_gb()
+            if total_gb > 0 and free_gb > 0:
+                # Keep a small safety margin to reduce OOM risk.
+                safety_margin_gb = 0.5
+                cap = max(0.1, min(0.9, (free_gb - safety_margin_gb) / total_gb))
+                if cap < gpu_memory_utilization:
+                    logger.info(
+                        f"Capping vLLM gpu_memory_utilization from {gpu_memory_utilization:.3f} to {cap:.3f} "
+                        f"(free_vram={free_gb:.2f}GB, total_vram={total_gb:.2f}GB)"
+                    )
+                    gpu_memory_utilization = cap
+            elif total_gb > 0:
+                logger.info(f"vLLM init VRAM: total_vram={total_gb:.2f}GB (free_vram unavailable)")
             
-            if low_gpu_memory_mode:
+            if low_gpu_memory_mode or (free_gb > 0 and free_gb < 6.0):
                 self.max_model_len = 2048
             else:
                 self.max_model_len = 4096
+            if free_gb > 0 and free_gb < 4.0:
+                self.max_model_len = 1024
             
             if sys.platform == "win32":
                 enforce_eager = True

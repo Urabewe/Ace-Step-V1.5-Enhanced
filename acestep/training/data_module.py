@@ -84,7 +84,7 @@ class PreprocessedTensorDataset(Dataset):
         tensor_path = self.valid_paths[idx]
         data = torch.load(tensor_path, map_location='cpu')
         
-        return {
+        out = {
             "target_latents": data["target_latents"],  # [T, 64]
             "attention_mask": data["attention_mask"],  # [T]
             "encoder_hidden_states": data["encoder_hidden_states"],  # [L, D]
@@ -92,6 +92,41 @@ class PreprocessedTensorDataset(Dataset):
             "context_latents": data["context_latents"],  # [T, 65]
             "metadata": data.get("metadata", {}),
         }
+        if "grad_norms" in data:
+            out["grad_norms"] = data["grad_norms"]
+        return out
+
+    def aggregate_grad_norms(
+        self,
+        max_samples: Optional[int] = None,
+    ) -> Optional[Dict[str, List[float]]]:
+        """Aggregate per-parameter gradient norms across samples for target selection.
+
+        Loads each .pt, collects grad_norms when present. Returns param_name -> list of
+        norms (one per sample) so caller can compute mean. Returns None if no sample has grad_norms.
+
+        Args:
+            max_samples: If set, only use this many samples (for speed).
+
+        Returns:
+            Dict param_name -> [norm1, norm2, ...] or None if no grad_norms in dataset.
+        """
+        agg: Dict[str, List[float]] = {}
+        paths = self.valid_paths[:max_samples] if max_samples else self.valid_paths
+        for tensor_path in paths:
+            try:
+                data = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                data = torch.load(tensor_path, map_location="cpu")
+            gn = data.get("grad_norms")
+            if not isinstance(gn, dict):
+                continue
+            for param_name, norm in gn.items():
+                if isinstance(norm, (int, float)):
+                    agg.setdefault(param_name, []).append(float(norm))
+        if not agg:
+            return None
+        return agg
 
 
 def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:

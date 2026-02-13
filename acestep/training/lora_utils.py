@@ -336,14 +336,25 @@ def load_training_checkpoint(
 
         result["elapsed_seconds"] = float(training_state.get("elapsed_seconds", 0.0))
 
-        # Load optimizer state if provided
+        # Load optimizer state if provided (skip when param groups mismatch, e.g. different LoRA rank/config)
         if optimizer is not None and "optimizer_state_dict" in training_state:
             try:
-                optimizer.load_state_dict(training_state["optimizer_state_dict"])
-                result["loaded_optimizer"] = True
-                logger.info("Optimizer state loaded from checkpoint")
+                saved = training_state["optimizer_state_dict"]
+                curr = optimizer.state_dict()
+                if len(saved.get("param_groups", [])) != len(curr.get("param_groups", [])):
+                    logger.warning(
+                        "Skipping optimizer state: parameter group count mismatch (e.g. different LoRA rank/config). "
+                        "Resuming with fresh optimizer."
+                    )
+                else:
+                    optimizer.load_state_dict(saved)
+                    result["loaded_optimizer"] = True
+                    logger.info("Optimizer state loaded from checkpoint")
             except Exception as e:
-                logger.warning(f"Failed to load optimizer state: {e}")
+                logger.warning(
+                    "Failed to load optimizer state: %s. Resuming with fresh optimizer (epoch/step and weights are still restored).",
+                    e,
+                )
 
         # Load scheduler state if provided
         if scheduler is not None and "scheduler_state_dict" in training_state:

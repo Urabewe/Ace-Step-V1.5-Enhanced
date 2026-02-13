@@ -1175,12 +1175,14 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
     
     # Preprocess dataset to tensor files
     training_section["preprocess_btn"].click(
-        fn=lambda output_dir, state: train_h.preprocess_dataset(
-            output_dir, dit_handler, state
+        fn=lambda output_dir, state, two_pass, save_grad_norms: train_h.preprocess_dataset(
+            output_dir, dit_handler, state, use_two_pass=two_pass, save_grad_norms=save_grad_norms
         ),
         inputs=[
             training_section["preprocess_output_dir"],
             training_section["dataset_builder_state"],
+            training_section["preprocess_two_pass"],
+            training_section["preprocess_save_grad_norms"],
         ],
         outputs=[training_section["preprocess_progress"]]
     )
@@ -1228,10 +1230,13 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
     )
     
     # Start training from preprocessed tensors
-    def training_wrapper(tensor_dir, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts):
+    def training_wrapper(tensor_dir, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, use_cont, cfg_drop, log_grad, od, resume_from, ts, use_grad_target, grad_top_k, use_grad_weight):
         try:
             for progress, log, plot, state in train_h.start_training(
-                tensor_dir, dit_handler, llm_handler, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, od, resume_from, ts
+                tensor_dir, dit_handler, llm_handler, source, raw_dir, raw_tag, raw_tag_pos, raw_auto, adapter_type, r, a, d, ld, la, lf, ldb, lut, lus, lwd, lr, ep, bs, ga, se, nw, pf, pw, pm, mp, tf32, ct, sh, sd, use_cont, cfg_drop, log_grad, od, resume_from, ts,
+                use_grad_norm_target_selection=bool(use_grad_target),
+                grad_norm_target_top_k=int(grad_top_k) if grad_top_k is not None else 4,
+                use_grad_norm_sample_weighting=bool(use_grad_weight),
             ):
                 yield progress, log, plot, state
         except Exception as e:
@@ -1272,9 +1277,15 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
             training_section["compile_training"],
             training_section["training_shift"],
             training_section["training_seed"],
+            training_section["use_continuous_timestep"],
+            training_section["cfg_dropout_prob"],
+            training_section["log_gradient_norms_every"],
             training_section["lora_output_dir"],
             training_section["resume_from"],
             training_section["training_state"],
+            training_section["use_grad_norm_target_selection"],
+            training_section["grad_norm_target_top_k"],
+            training_section["use_grad_norm_sample_weighting"],
         ],
         outputs=[
             training_section["training_progress"],

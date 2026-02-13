@@ -341,6 +341,16 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                             info=t("training.tensor_output_info"),
                         )
                     with gr.Column(scale=1):
+                        preprocess_two_pass = gr.Checkbox(
+                            label=t("training.preprocess_two_pass"),
+                            value=False,
+                            info=t("training.preprocess_two_pass_info"),
+                        )
+                        preprocess_save_grad_norms = gr.Checkbox(
+                            label=t("training.preprocess_save_grad_norms"),
+                            value=False,
+                            info=t("training.preprocess_save_grad_norms_info"),
+                        )
                         preprocess_btn = gr.Button(
                             t("training.preprocess_btn"),
                             variant="primary",
@@ -598,9 +608,9 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                 
                 with gr.Row():
                     save_every_n_epochs = gr.Slider(
-                        minimum=50,
+                        minimum=10,
                         maximum=1000,
-                        step=50,
+                        step=10,
                         value=200,
                         label=t("training.save_every_n_epochs"),
                     )
@@ -638,6 +648,46 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                         label=t("training.compile_training"),
                         value=False,
                         info=t("training.compile_training_info"),
+                    )
+
+                with gr.Row():
+                    use_continuous_timestep = gr.Checkbox(
+                        label=t("training.use_continuous_timestep"),
+                        value=False,
+                        info=t("training.use_continuous_timestep_info"),
+                    )
+                    cfg_dropout_prob = gr.Slider(
+                        minimum=0.0,
+                        maximum=0.5,
+                        step=0.05,
+                        value=0.15,
+                        label=t("training.cfg_dropout_prob"),
+                        info=t("training.cfg_dropout_prob_info"),
+                    )
+                    log_gradient_norms_every = gr.Number(
+                        label=t("training.log_gradient_norms_every"),
+                        value=0,
+                        precision=0,
+                        minimum=0,
+                        info=t("training.log_gradient_norms_every_info"),
+                    )
+                    use_grad_norm_target_selection = gr.Checkbox(
+                        label=t("training.use_grad_norm_target_selection"),
+                        value=True,
+                        info=t("training.use_grad_norm_target_selection_info"),
+                    )
+                    grad_norm_target_top_k = gr.Number(
+                        label=t("training.grad_norm_target_top_k"),
+                        value=4,
+                        precision=0,
+                        minimum=1,
+                        maximum=8,
+                        info=t("training.grad_norm_target_top_k_info"),
+                    )
+                    use_grad_norm_sample_weighting = gr.Checkbox(
+                        label=t("training.use_grad_norm_sample_weighting"),
+                        value=True,
+                        info=t("training.use_grad_norm_sample_weighting_info"),
                     )
                 
                 gr.HTML(f"<hr><h3>🧠 {t('training.vram_presets')}</h3>")
@@ -798,6 +848,8 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
         "load_existing_dataset_btn": load_existing_dataset_btn,
         "load_existing_status": load_existing_status,
         "preprocess_output_dir": preprocess_output_dir,
+        "preprocess_two_pass": preprocess_two_pass,
+        "preprocess_save_grad_norms": preprocess_save_grad_norms,
         "preprocess_btn": preprocess_btn,
         "preprocess_progress": preprocess_progress,
         "dataset_builder_state": dataset_builder_state,
@@ -835,6 +887,12 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
         "matmul_precision": matmul_precision,
         "allow_tf32": allow_tf32,
         "compile_training": compile_training,
+        "use_continuous_timestep": use_continuous_timestep,
+        "cfg_dropout_prob": cfg_dropout_prob,
+        "log_gradient_norms_every": log_gradient_norms_every,
+        "use_grad_norm_target_selection": use_grad_norm_target_selection,
+        "grad_norm_target_top_k": grad_norm_target_top_k,
+        "use_grad_norm_sample_weighting": use_grad_norm_sample_weighting,
         "lora_output_dir": lora_output_dir,
         "resume_from": resume_from,
         "start_training_btn": start_training_btn,

@@ -24,6 +24,57 @@ except ImportError:
 from acestep.training.configs import LoKRConfig, LoRAConfig
 
 
+def build_optimizer_state_by_name(
+    optimizer: torch.optim.Optimizer,
+    param_id_to_name: Dict[int, str],
+) -> Dict[str, Dict[str, Any]]:
+    """Build a dict of optimizer state keyed by param name for resume across config changes.
+    State (e.g. exp_avg, exp_avg_sq) is copied to CPU for saving.
+    """
+    state_by_name: Dict[str, Dict[str, Any]] = {}
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            name = param_id_to_name.get(id(p))
+            if name is None:
+                continue
+            if p not in optimizer.state:
+                continue
+            raw = optimizer.state[p]
+            state_by_name[name] = {}
+            for k, v in raw.items():
+                if isinstance(v, torch.Tensor):
+                    state_by_name[name][k] = v.detach().cpu().clone()
+                else:
+                    state_by_name[name][k] = v
+    return state_by_name
+
+
+def load_optimizer_state_by_name(
+    optimizer: torch.optim.Optimizer,
+    state_by_name: Dict[str, Dict[str, Any]],
+    param_id_to_name: Dict[int, str],
+    device: torch.device,
+) -> int:
+    """Load optimizer state for params that match by name. Returns number of params restored."""
+    restored = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            name = param_id_to_name.get(id(p))
+            if name is None or name not in state_by_name:
+                continue
+            saved = state_by_name[name]
+            target_device = getattr(p, "device", device)
+            loaded = {}
+            for k, v in saved.items():
+                if isinstance(v, torch.Tensor):
+                    loaded[k] = v.to(target_device)
+                else:
+                    loaded[k] = v
+            optimizer.state[p] = loaded
+            restored += 1
+    return restored
+
+
 def check_lycoris_available() -> bool:
     """Check if LyCORIS library is available."""
     return LYCORIS_AVAILABLE
@@ -312,8 +363,11 @@ def load_lora_training_checkpoint_lycoris(
     optimizer=None,
     scheduler=None,
     device: torch.device = None,
+    param_id_to_name: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
-    """Load LoRA training checkpoint."""
+    """Load LoRA training checkpoint. If param_id_to_name is provided and full optimizer load
+    fails (e.g. different rank), loads optimizer state by param name from optimizer_state_by_name when present.
+    """
     result = {
         "epoch": 0,
         "global_step": 0,
@@ -332,17 +386,46 @@ def load_lora_training_checkpoint_lycoris(
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
     if os.path.exists(state_path):
         map_location = device if device else "cpu"
-        training_state = torch.load(state_path, map_location=map_location)
+        try:
+            training_state = torch.load(state_path, map_location=map_location, weights_only=False)
+        except TypeError:
+            training_state = torch.load(state_path, map_location=map_location)
         result["epoch"] = training_state.get("epoch", 0)
         result["global_step"] = training_state.get("global_step", 0)
         result["lora_config"] = training_state.get("lora_config", None)
+        optimizer_loaded = False
         if optimizer is not None and "optimizer_state_dict" in training_state:
             try:
-                optimizer.load_state_dict(training_state["optimizer_state_dict"])
-                result["loaded_optimizer"] = True
-                logger.info("Optimizer state loaded from LoRA checkpoint")
+                saved = training_state["optimizer_state_dict"]
+                curr = optimizer.state_dict()
+                if len(saved.get("param_groups", [])) != len(curr.get("param_groups", [])):
+                    logger.warning(
+                        "Parameter group count mismatch; trying to load optimizer state by param name from .pt file."
+                    )
+                else:
+                    optimizer.load_state_dict(saved)
+                    result["loaded_optimizer"] = True
+                    optimizer_loaded = True
+                    logger.info("Optimizer state loaded from LoRA checkpoint")
             except Exception as e:
-                logger.warning(f"Failed to load optimizer state: {e}")
+                logger.warning(
+                    "Full optimizer load failed: %s. Trying to load by param name from .pt file.",
+                    e,
+                )
+        if not optimizer_loaded and optimizer is not None and param_id_to_name is not None and "optimizer_state_by_name" in training_state:
+            try:
+                dev = device if device is not None else torch.device("cpu")
+                n = load_optimizer_state_by_name(
+                    optimizer,
+                    training_state["optimizer_state_by_name"],
+                    param_id_to_name,
+                    dev,
+                )
+                if n > 0:
+                    result["loaded_optimizer"] = True
+                    logger.info("Loaded optimizer state from .pt file for %d params (by name)", n)
+            except Exception as e:
+                logger.warning("Could not load optimizer state by name: %s", e)
         if scheduler is not None and "scheduler_state_dict" in training_state:
             try:
                 scheduler.load_state_dict(training_state["scheduler_state_dict"])
@@ -415,8 +498,11 @@ def load_lokr_training_checkpoint(
     optimizer=None,
     scheduler=None,
     device: torch.device = None,
+    param_id_to_name: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
-    """Load LoKR training checkpoint."""
+    """Load LoKR training checkpoint. If param_id_to_name is provided and full optimizer load
+    fails, loads optimizer state by param name from optimizer_state_by_name when present.
+    """
     result = {
         "epoch": 0,
         "global_step": 0,
@@ -436,20 +522,48 @@ def load_lokr_training_checkpoint(
 
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
     if os.path.exists(state_path):
-        map_location = device if device else "cpu"
-        training_state = torch.load(state_path, map_location=map_location)
+        try:
+            training_state = torch.load(state_path, map_location=device or "cpu", weights_only=False)
+        except TypeError:
+            training_state = torch.load(state_path, map_location=device or "cpu")
 
         result["epoch"] = training_state.get("epoch", 0)
         result["global_step"] = training_state.get("global_step", 0)
         result["lokr_config"] = training_state.get("lokr_config", None)
 
+        optimizer_loaded = False
         if optimizer is not None and "optimizer_state_dict" in training_state:
             try:
-                optimizer.load_state_dict(training_state["optimizer_state_dict"])
-                result["loaded_optimizer"] = True
-                logger.info("Optimizer state loaded from LoKR checkpoint")
+                saved = training_state["optimizer_state_dict"]
+                curr = optimizer.state_dict()
+                if len(saved.get("param_groups", [])) != len(curr.get("param_groups", [])):
+                    logger.warning(
+                        "Parameter group count mismatch; trying to load optimizer state by param name from .pt file."
+                    )
+                else:
+                    optimizer.load_state_dict(saved)
+                    result["loaded_optimizer"] = True
+                    optimizer_loaded = True
+                    logger.info("Optimizer state loaded from LoKR checkpoint")
             except Exception as e:
-                logger.warning(f"Failed to load optimizer state: {e}")
+                logger.warning(
+                    "Full optimizer load failed: %s. Trying to load by param name from .pt file.",
+                    e,
+                )
+        if not optimizer_loaded and optimizer is not None and param_id_to_name is not None and "optimizer_state_by_name" in training_state:
+            try:
+                dev = device if device is not None else torch.device("cpu")
+                n = load_optimizer_state_by_name(
+                    optimizer,
+                    training_state["optimizer_state_by_name"],
+                    param_id_to_name,
+                    dev,
+                )
+                if n > 0:
+                    result["loaded_optimizer"] = True
+                    logger.info("Loaded optimizer state from .pt file for %d params (by name)", n)
+            except Exception as e:
+                logger.warning("Could not load optimizer state by name: %s", e)
 
         if scheduler is not None and "scheduler_state_dict" in training_state:
             try:

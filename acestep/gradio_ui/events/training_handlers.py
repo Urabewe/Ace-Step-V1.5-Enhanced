@@ -470,11 +470,14 @@ def preprocess_dataset(
     output_dir: str,
     dit_handler,
     builder_state: Optional[DatasetBuilder],
+    use_two_pass: bool = False,
+    save_grad_norms: bool = False,
     progress=gr.Progress(track_tqdm=True),
 ) -> str:
     """Preprocess dataset to tensor files for fast training.
     
     This converts audio files to VAE latents and text to embeddings.
+    If save_grad_norms is True, also computes per-parameter gradient norms per sample for rank/target selection.
     
     Returns:
         Status message
@@ -512,14 +515,24 @@ def preprocess_dataset(
         except Exception:
             pass
     
-    # Run preprocessing
-    t0 = debug_start_for("dataset", "preprocess_to_tensors")
-    output_paths, status = builder_state.preprocess_to_tensors(
-        dit_handler=dit_handler,
-        output_dir=output_dir.strip(),
-        progress_callback=progress_callback,
-    )
-    debug_end_for("dataset", "preprocess_to_tensors", t0)
+    if use_two_pass:
+        t0 = debug_start_for("dataset", "preprocess_to_tensors_two_pass")
+        output_paths, status = builder_state.preprocess_to_tensors_two_pass(
+            dit_handler=dit_handler,
+            output_dir=output_dir.strip(),
+            progress_callback=progress_callback,
+            save_grad_norms=save_grad_norms,
+        )
+        debug_end_for("dataset", "preprocess_to_tensors_two_pass", t0)
+    else:
+        t0 = debug_start_for("dataset", "preprocess_to_tensors")
+        output_paths, status = builder_state.preprocess_to_tensors(
+            dit_handler=dit_handler,
+            output_dir=output_dir.strip(),
+            progress_callback=progress_callback,
+            save_grad_norms=save_grad_norms,
+        )
+        debug_end_for("dataset", "preprocess_to_tensors", t0)
     
     return status
 
@@ -626,9 +639,15 @@ def start_training(
     compile_training: bool,
     training_shift: float,
     training_seed: int,
+    use_continuous_timestep: bool,
+    cfg_dropout_prob: float,
+    log_gradient_norms_every: int,
     lora_output_dir: str,
     resume_from: str,
     training_state: Dict,
+    use_grad_norm_target_selection: bool = True,
+    grad_norm_target_top_k: int = 4,
+    use_grad_norm_sample_weighting: bool = True,
     progress=None,
 ):
     """Start LoRA training from preprocessed tensors.
@@ -773,6 +792,12 @@ def start_training(
             matmul_precision=matmul_precision,
             allow_tf32=allow_tf32,
             compile_decoder=compile_training,
+            use_continuous_timestep=use_continuous_timestep,
+            cfg_dropout_prob=cfg_dropout_prob,
+            log_gradient_norms_every=int(log_gradient_norms_every or 0),
+            use_grad_norm_target_selection=use_grad_norm_target_selection,
+            grad_norm_target_top_k=grad_norm_target_top_k,
+            use_grad_norm_sample_weighting=use_grad_norm_sample_weighting,
         )
         if adapter_type == "lokr":
             from acestep.training.trainer import LoKRTrainer

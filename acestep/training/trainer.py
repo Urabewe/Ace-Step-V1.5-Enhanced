@@ -24,6 +24,14 @@ except ImportError:
     LIGHTNING_AVAILABLE = False
     logger.warning("Lightning Fabric not installed. Training will use basic training loop.")
 
+# Optional bitsandbytes optimizer
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    logger.warning("bitsandbytes not installed. Using standard AdamW.")
+
 from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
 from acestep.training.lokr_utils import (
     inject_lora_into_dit_lycoris,
@@ -34,39 +42,185 @@ from acestep.training.lokr_utils import (
     save_lokr_weights,
     save_lokr_training_checkpoint,
     load_lokr_training_checkpoint,
+    build_optimizer_state_by_name,
     check_lycoris_available,
 )
-from acestep.training.data_module import PreprocessedDataModule
+from acestep.training.data_module import PreprocessedDataModule, PreprocessedTensorDataset
 
 
 # Turbo model shift=3.0 discrete timesteps (8 steps, same as inference)
 TURBO_SHIFT3_TIMESTEPS = [1.0, 0.9545454545454546, 0.9, 0.8333333333333334, 0.75, 0.6428571428571429, 0.5, 0.3]
 
 
-def sample_discrete_timestep(bsz, device, dtype):
-    """Sample timesteps from discrete turbo shift=3 schedule.
-    
-    For each sample in the batch, randomly select one of the 8 discrete timesteps
-    used by the turbo model with shift=3.0.
-    
-    Args:
-        bsz: Batch size
-        device: Device
-        dtype: Data type (should be bfloat16)
-        
-    Returns:
-        Tuple of (t, r) where both are the same sampled timestep
-    """
-    # Randomly select indices for each sample in batch
-    indices = torch.randint(0, len(TURBO_SHIFT3_TIMESTEPS), (bsz,), device=device)
-    
-    # Convert to tensor and index
-    timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=device, dtype=dtype)
-    t = timesteps_tensor[indices]
-    
-    # r = t for this training setup
+def _apply_shift(timesteps: torch.Tensor, shift: float) -> torch.Tensor:
+    """Apply timestep shift (t = shift * t / (1 + (shift - 1) * t))."""
+    if shift == 1.0:
+        return timesteps
+    return shift * timesteps / (1.0 + (shift - 1.0) * timesteps)
+
+
+def _extract_timesteps_from_config(config: Optional[Any]) -> Optional[List[float]]:
+    if config is None:
+        return None
+    for key in ("timesteps", "timestep", "sampling_timesteps"):
+        raw = getattr(config, key, None)
+        if isinstance(raw, (list, tuple)) and raw:
+            try:
+                return [float(x) for x in raw]
+            except Exception:
+                return None
+    return None
+
+
+def _ensure_trainable_params_fp32(module: nn.Module) -> Tuple[int, int]:
+    """Force trainable floating-point parameters to fp32."""
+    casted = 0
+    total = 0
+    for p in module.parameters():
+        if not p.requires_grad:
+            continue
+        total += 1
+        if p.is_floating_point() and p.dtype != torch.float32:
+            with torch.no_grad():
+                p.data = p.data.float()
+            casted += 1
+    return casted, total
+
+
+def _build_param_name_lookup(module: nn.Module, extra_module: Optional[nn.Module] = None) -> Dict[int, str]:
+    """Build a best-effort id(param) -> name lookup for debug logging."""
+    lookup: Dict[int, str] = {}
+    for name, p in module.named_parameters():
+        lookup[id(p)] = name
+    if extra_module is not None:
+        for name, p in extra_module.named_parameters():
+            lookup.setdefault(id(p), f"lycoris_net.{name}")
+    return lookup
+
+
+def _count_nonfinite_grads_detailed(
+    params: List[torch.nn.Parameter],
+    param_name_lookup: Dict[int, str],
+    detail_limit: int = 8,
+) -> Tuple[int, int, List[str]]:
+    """Count non-finite grads and return up to `detail_limit` offending tensor details."""
+    nonfinite = 0
+    total_with_grad = 0
+    details: List[str] = []
+
+    for p in params:
+        g = p.grad
+        if g is None:
+            continue
+        total_with_grad += 1
+        if torch.isfinite(g).all():
+            continue
+
+        nonfinite += 1
+        if len(details) >= detail_limit:
+            continue
+
+        pname = param_name_lookup.get(id(p), f"<unnamed:{id(p)}>")
+        g32 = g.detach().float()
+        nan_count = int(torch.isnan(g32).sum().item())
+        inf_count = int(torch.isinf(g32).sum().item())
+        finite_vals = g32[torch.isfinite(g32)]
+        max_abs_finite = float(finite_vals.abs().max().item()) if finite_vals.numel() else float("nan")
+
+        p32 = p.detach().float()
+        param_nonfinite = int((~torch.isfinite(p32)).sum().item())
+        details.append(
+            f"{pname} | shape={tuple(p.shape)} grad_dtype={g.dtype} "
+            f"nan={nan_count} inf={inf_count} max_abs_finite={max_abs_finite:.3e} "
+            f"param_nonfinite={param_nonfinite}"
+        )
+
+    return nonfinite, total_with_grad, details
+
+
+def _unwrap_stale_fabric_decoder(model: nn.Module) -> bool:
+    """Unwrap stale Lightning Fabric wrappers from decoder left by previous runs."""
+    if model is None or not hasattr(model, "decoder"):
+        return False
+    decoder = model.decoder
+    unwrapped = False
+    while hasattr(decoder, "_forward_module") and isinstance(getattr(decoder, "_forward_module"), nn.Module):
+        decoder = decoder._forward_module
+        unwrapped = True
+    if unwrapped:
+        model.decoder = decoder
+    return unwrapped
+
+
+def _select_optimizer(
+    params: List[torch.nn.Parameter],
+    lr: float,
+    weight_decay: float,
+    device_type: str,
+) -> torch.optim.Optimizer:
+    """Select AdamW or bitsandbytes AdamW8bit if available."""
+    if HAS_BNB and device_type == "cuda":
+        return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=weight_decay)
+    return AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
+def _sample_flowmatching_t_r(
+    bsz: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    data_proportion: float,
+    timestep_mu: float,
+    timestep_sigma: float,
+    use_meanflow: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample continuous timesteps for base flow-matching training."""
+    t = torch.sigmoid(torch.randn((bsz,), device=device, dtype=dtype) * timestep_sigma + timestep_mu)
+    r = torch.sigmoid(torch.randn((bsz,), device=device, dtype=dtype) * timestep_sigma + timestep_mu)
+    t, r = torch.maximum(t, r), torch.minimum(t, r)
+    if not use_meanflow:
+        data_proportion = 1.0
+    data_size = int(bsz * data_proportion)
+    zero_mask = torch.arange(bsz, device=device) < data_size
+    r = torch.where(zero_mask, t, r)
+    return t, r
+
+
+def build_training_timesteps(
+    model: nn.Module,
+    training_config: TrainingConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build training timesteps based on the loaded model configuration."""
+    config = getattr(model, "config", None)
+    is_turbo = bool(getattr(config, "is_turbo", False))
+
+    if is_turbo:
+        return torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=device, dtype=dtype)
+
+    config_timesteps = _extract_timesteps_from_config(config)
+    if config_timesteps:
+        ts = torch.tensor(config_timesteps, device=device, dtype=dtype)
+        return ts.clamp(0.0, 1.0)
+
+    shift = getattr(config, "shift", training_config.shift)
+    num_steps = getattr(config, "num_inference_steps", training_config.num_inference_steps)
+
+    # If still on turbo defaults, switch to base-friendly defaults.
+    if shift == 3.0:
+        shift = 1.0
+    if num_steps == 8:
+        num_steps = 32
+
+    timesteps = torch.linspace(1.0, 0.0, int(num_steps), device=device, dtype=dtype)
+    return _apply_shift(timesteps, shift)
+
+
+def sample_discrete_timestep(bsz: int, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample timesteps from a precomputed discrete schedule."""
+    indices = torch.randint(0, timesteps.numel(), (bsz,), device=timesteps.device)
+    t = timesteps[indices]
     r = t
-    
     return t, r
 
 
@@ -119,6 +273,16 @@ class PreprocessedLoRAModule(nn.Module):
         
         # Model config for flow matching
         self.config = model.config
+        self.training_timesteps = build_training_timesteps(
+            model=self.model,
+            training_config=self.training_config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        logger.info(
+            f"Training schedule: steps={self.training_timesteps.numel()}, shift={getattr(self.config, 'shift', self.training_config.shift)}, "
+            f"turbo={getattr(self.config, 'is_turbo', False)}"
+        )
         
         # Store training losses
         self.training_losses = []
@@ -126,7 +290,7 @@ class PreprocessedLoRAModule(nn.Module):
     def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Single training step using preprocessed tensors.
         
-        Note: This is a distilled turbo model, NO CFG is used.
+        Note: This uses the model's timestep schedule; turbo models are discrete.
         
         Args:
             batch: Dictionary containing pre-computed tensors:
@@ -152,13 +316,34 @@ class PreprocessedLoRAModule(nn.Module):
             
             bsz = target_latents.shape[0]
             
+            # Classifier-free guidance dropout: null condition for cfg_dropout_prob of the batch
+            if self.training_config.cfg_dropout_prob > 0:
+                cfg_mask = torch.rand(bsz, device=self.device, dtype=encoder_hidden_states.dtype) < self.training_config.cfg_dropout_prob
+                encoder_hidden_states = encoder_hidden_states.clone()
+                encoder_attention_mask = encoder_attention_mask.clone()
+                encoder_hidden_states[cfg_mask] = 0
+                encoder_attention_mask[cfg_mask] = 0
+            
             # Flow matching: sample noise x1 and interpolate with data x0
             x1 = torch.randn_like(target_latents)  # Noise
             x0 = target_latents  # Data
             
-            # Sample timesteps from discrete turbo shift=3 schedule (8 steps)
-            # Use the same dtype as the latents to avoid bf16 on MPS/CPU issues.
-            t, r = sample_discrete_timestep(bsz, self.device, target_latents.dtype)
+            # Sample timesteps: continuous (logit-normal) or discrete schedule
+            use_continuous = self.training_config.use_continuous_timestep
+            if use_continuous or not getattr(self.config, "is_turbo", False):
+                t, r = _sample_flowmatching_t_r(
+                    bsz=bsz,
+                    device=self.device,
+                    dtype=target_latents.dtype,
+                    data_proportion=getattr(self.config, "data_proportion", 0.5),
+                    timestep_mu=getattr(self.config, "timestep_mu", -0.4),
+                    timestep_sigma=getattr(self.config, "timestep_sigma", 1.0),
+                    use_meanflow=False,
+                )
+            else:
+                if self.training_timesteps.dtype != target_latents.dtype:
+                    self.training_timesteps = self.training_timesteps.to(dtype=target_latents.dtype)
+                t, r = sample_discrete_timestep(bsz, self.training_timesteps)
             t_ = t.unsqueeze(-1).unsqueeze(-1)
             
             # Interpolate: x_t = t * x1 + (1 - t) * x0
@@ -181,6 +366,20 @@ class PreprocessedLoRAModule(nn.Module):
         
         # Convert loss to float32 for stable backward pass
         diffusion_loss = diffusion_loss.float()
+
+        # Optional: weight loss by precomputed sample importance (faster convergence)
+        if self.training_config.use_grad_norm_sample_weighting and batch.get("grad_norms"):
+            gn_list = batch["grad_norms"]
+            weights = []
+            for gn in gn_list:
+                if gn and isinstance(gn, dict) and gn:
+                    weights.append(sum(gn.values()) / len(gn))
+                else:
+                    weights.append(1.0)
+            if weights:
+                batch_w = sum(weights) / len(weights)
+                batch_w = min(2.0, max(0.25, batch_w))
+                diffusion_loss = diffusion_loss * batch_w
         
         self.training_losses.append(diffusion_loss.item())
         
@@ -217,6 +416,16 @@ class PreprocessedLoKRModule(nn.Module):
 
         self.config = model.config
         self.training_losses = []
+        self.training_timesteps = build_training_timesteps(
+            model=self.model,
+            training_config=self.training_config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        logger.info(
+            f"Training schedule: steps={self.training_timesteps.numel()}, shift={getattr(self.config, 'shift', self.training_config.shift)}, "
+            f"turbo={getattr(self.config, 'is_turbo', False)}"
+        )
 
     def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         _device_type = self.device if isinstance(self.device, str) else self.device.type
@@ -230,10 +439,31 @@ class PreprocessedLoKRModule(nn.Module):
             context_latents = batch["context_latents"].to(self.device)
 
             bsz = target_latents.shape[0]
+            if self.training_config.cfg_dropout_prob > 0:
+                cfg_mask = torch.rand(bsz, device=self.device, dtype=encoder_hidden_states.dtype) < self.training_config.cfg_dropout_prob
+                encoder_hidden_states = encoder_hidden_states.clone()
+                encoder_attention_mask = encoder_attention_mask.clone()
+                encoder_hidden_states[cfg_mask] = 0
+                encoder_attention_mask[cfg_mask] = 0
+
             x1 = torch.randn_like(target_latents)
             x0 = target_latents
 
-            t, r = sample_discrete_timestep(bsz, self.device, torch.bfloat16)
+            use_continuous = self.training_config.use_continuous_timestep
+            if use_continuous or not getattr(self.config, "is_turbo", False):
+                t, r = _sample_flowmatching_t_r(
+                    bsz=bsz,
+                    device=self.device,
+                    dtype=target_latents.dtype,
+                    data_proportion=getattr(self.config, "data_proportion", 0.5),
+                    timestep_mu=getattr(self.config, "timestep_mu", -0.4),
+                    timestep_sigma=getattr(self.config, "timestep_sigma", 1.0),
+                    use_meanflow=False,
+                )
+            else:
+                if self.training_timesteps.dtype != target_latents.dtype:
+                    self.training_timesteps = self.training_timesteps.to(dtype=target_latents.dtype)
+                t, r = sample_discrete_timestep(bsz, self.training_timesteps)
             t_ = t.unsqueeze(-1).unsqueeze(-1)
             xt = t_ * x1 + (1.0 - t_) * x0
 
@@ -251,6 +481,18 @@ class PreprocessedLoKRModule(nn.Module):
             diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
 
         diffusion_loss = diffusion_loss.float()
+        if self.training_config.use_grad_norm_sample_weighting and batch.get("grad_norms"):
+            gn_list = batch["grad_norms"]
+            weights = []
+            for gn in gn_list:
+                if gn and isinstance(gn, dict) and gn:
+                    weights.append(sum(gn.values()) / len(gn))
+                else:
+                    weights.append(1.0)
+            if weights:
+                batch_w = sum(weights) / len(weights)
+                batch_w = min(2.0, max(0.25, batch_w))
+                diffusion_loss = diffusion_loss * batch_w
         self.training_losses.append(diffusion_loss.item())
         return diffusion_loss
 
@@ -289,6 +531,8 @@ class LoRATrainer:
             return "❌ Model not initialized. Please initialize the service first."
 
         warning_msg = None
+        if _unwrap_stale_fabric_decoder(self.dit_handler.model):
+            logger.info("Unwrapped stale Fabric decoder wrapper before LoRA training.")
         # torch.compile wraps the model; LoRA injection after compile is unreliable.
         if hasattr(self.dit_handler.model, "_orig_mod"):
             logger.warning("Model is torch.compile'd; disabling compile for LoRA training.")
@@ -336,11 +580,39 @@ class LoRATrainer:
             if not os.path.exists(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
-            
+
+            # Optionally derive LoRA target_modules from precomputed grad norms (fewer params = faster)
+            effective_lora_config = self.lora_config
+            if self.training_config.use_grad_norm_target_selection:
+                try:
+                    from acestep.training.grad_norm_utils import get_top_target_modules_by_grad_norm
+                    dataset_for_agg = PreprocessedTensorDataset(tensor_dir)
+                    agg = dataset_for_agg.aggregate_grad_norms()
+                    if agg:
+                        param_mean = {k: sum(v) / len(v) for k, v in agg.items()}
+                        top_modules = get_top_target_modules_by_grad_norm(
+                            param_mean,
+                            top_k=self.training_config.grad_norm_target_top_k,
+                        )
+                        effective_lora_config = LoRAConfig(
+                            r=self.lora_config.r,
+                            alpha=self.lora_config.alpha,
+                            dropout=self.lora_config.dropout,
+                            target_modules=top_modules,
+                            bias=self.lora_config.bias,
+                        )
+                        logger.info(
+                            "Grad-norm target selection: using target_modules=%s (from precomputed grad norms)",
+                            top_modules,
+                        )
+                        yield 0, 0.0, f"🎯 Grad-norm targets: {top_modules} (fewer params = faster)"
+                except Exception as e:
+                    logger.warning("Grad-norm target selection failed, using config targets: %s", e)
+
             # Create training module
             self.module = PreprocessedLoRAModule(
                 model=self.dit_handler.model,
-                lora_config=self.lora_config,
+                lora_config=effective_lora_config,
                 training_config=self.training_config,
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
@@ -416,13 +688,21 @@ class LoRATrainer:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
         
+        device_type = self.dit_handler.device if isinstance(self.dit_handler.device, str) else self.dit_handler.device.type
+        if device_type == "mps":
+            casted, total = _ensure_trainable_params_fp32(self.module.model)
+            if casted:
+                logger.info(f"Cast {casted}/{total} trainable params to fp32 for MPS stability.")
+
         yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
         
-        optimizer = AdamW(
+        optimizer = _select_optimizer(
             trainable_params,
             lr=self.training_config.learning_rate,
             weight_decay=self.training_config.weight_decay,
+            device_type=device_type,
         )
+        param_name_lookup = _build_param_name_lookup(self.module.model, self.module.lycoris_net)
         
         # Calculate total steps
         total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
@@ -482,6 +762,7 @@ class LoRATrainer:
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=self.module.device,
+                    param_id_to_name=param_name_lookup,
                 )
 
                 if checkpoint_info["weights_path"]:
@@ -524,9 +805,10 @@ class LoRATrainer:
                         "checkpoints",
                         f"paused_epoch_{epoch+1}_step_{global_step}",
                     )
-                    extra_state = None
+                    extra_state = {}
                     if training_state is not None and "elapsed_seconds" in training_state:
-                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                        extra_state["elapsed_seconds"] = training_state["elapsed_seconds"]
+                    extra_state["optimizer_state_by_name"] = build_optimizer_state_by_name(optimizer, param_name_lookup)
                     save_lora_training_checkpoint_lycoris(
                         self.module.lycoris_net,
                         optimizer,
@@ -560,6 +842,23 @@ class LoRATrainer:
                         max_norm=self.training_config.max_grad_norm,
                     )
                     
+                    nonfinite, total_with_grad, details = _count_nonfinite_grads_detailed(
+                        trainable_params, param_name_lookup
+                    )
+                    if nonfinite:
+                        logger.warning(
+                            f"Detected {nonfinite}/{total_with_grad} non-finite gradients; example: "
+                            + "; ".join(details)
+                        )
+
+                    # Log per-parameter gradient norms (for rank/target selection) before step
+                    next_step = global_step + 1
+                    if self.training_config.log_gradient_norms_every > 0 and next_step % self.training_config.log_gradient_norms_every == 0:
+                        for p in trainable_params:
+                            if p.grad is not None and torch.isfinite(p.grad).all():
+                                name = param_name_lookup.get(id(p), f"param_{id(p)}")
+                                self.fabric.log(f"grad_norm/{name}", p.grad.norm().item(), step=next_step)
+
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -589,9 +888,10 @@ class LoRATrainer:
             # Save checkpoint
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
-                extra_state = None
+                extra_state = {}
                 if training_state is not None and "elapsed_seconds" in training_state:
-                    extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                    extra_state["elapsed_seconds"] = training_state["elapsed_seconds"]
+                extra_state["optimizer_state_by_name"] = build_optimizer_state_by_name(optimizer, param_name_lookup)
                 save_lora_training_checkpoint_lycoris(
                     self.module.lycoris_net,
                     optimizer,
@@ -629,11 +929,19 @@ class LoRATrainer:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
         
-        optimizer = AdamW(
+        device_type = self.dit_handler.device if isinstance(self.dit_handler.device, str) else self.dit_handler.device.type
+        if device_type == "mps":
+            casted, total = _ensure_trainable_params_fp32(self.module.model)
+            if casted:
+                logger.info(f"Cast {casted}/{total} trainable params to fp32 for MPS stability.")
+
+        optimizer = _select_optimizer(
             trainable_params,
             lr=self.training_config.learning_rate,
             weight_decay=self.training_config.weight_decay,
+            device_type=device_type,
         )
+        param_name_lookup = _build_param_name_lookup(self.module.model, self.module.lycoris_net)
         
         total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
@@ -661,9 +969,10 @@ class LoRATrainer:
                         "checkpoints",
                         f"paused_epoch_{epoch+1}_step_{global_step}",
                     )
-                    extra_state = None
+                    extra_state = {}
                     if training_state is not None and "elapsed_seconds" in training_state:
-                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                        extra_state["elapsed_seconds"] = training_state["elapsed_seconds"]
+                    extra_state["optimizer_state_by_name"] = build_optimizer_state_by_name(optimizer, param_name_lookup)
                     save_lora_training_checkpoint_lycoris(
                         self.module.lycoris_net,
                         optimizer,
@@ -679,7 +988,7 @@ class LoRATrainer:
                     avg_loss = accumulated_loss / max(accumulation_step, 1)
                     yield global_step, avg_loss, f"⏸️ Paused. Checkpoint saved to {checkpoint_dir}"
                     return
-                
+
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
@@ -688,6 +997,20 @@ class LoRATrainer:
                 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(trainable_params, self.training_config.max_grad_norm)
+                    nonfinite, total_with_grad, details = _count_nonfinite_grads_detailed(
+                        trainable_params, param_name_lookup
+                    )
+                    if nonfinite:
+                        logger.warning(
+                            f"Detected {nonfinite}/{total_with_grad} non-finite gradients; example: "
+                            + "; ".join(details)
+                        )
+                    next_step = global_step + 1
+                    if self.training_config.log_gradient_norms_every > 0 and next_step % self.training_config.log_gradient_norms_every == 0:
+                        for p in trainable_params:
+                            if p.grad is not None and torch.isfinite(p.grad).all():
+                                name = param_name_lookup.get(id(p), f"param_{id(p)}")
+                                logger.debug(f"grad_norm/{name} = {p.grad.norm().item():.6f}")
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -742,6 +1065,8 @@ class LoKRTrainer:
         if self.dit_handler.model is None:
             return "❌ Model not initialized. Please initialize the service first."
         warning_msg = None
+        if _unwrap_stale_fabric_decoder(self.dit_handler.model):
+            logger.info("Unwrapped stale Fabric decoder wrapper before LoKR training.")
         if hasattr(self.dit_handler.model, "_orig_mod"):
             logger.warning("Model is torch.compile'd; disabling compile for LoKR training.")
             self.dit_handler.model = self.dit_handler.model._orig_mod
@@ -859,13 +1184,21 @@ class LoKRTrainer:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
 
+        device_type = self.dit_handler.device if isinstance(self.dit_handler.device, str) else self.dit_handler.device.type
+        if device_type == "mps":
+            casted, total = _ensure_trainable_params_fp32(self.module.model)
+            if casted:
+                logger.info(f"Cast {casted}/{total} trainable params to fp32 for MPS stability.")
+
         yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
 
-        optimizer = AdamW(
+        optimizer = _select_optimizer(
             trainable_params,
             lr=self.training_config.learning_rate,
             weight_decay=self.training_config.weight_decay,
+            device_type=device_type,
         )
+        param_name_lookup = _build_param_name_lookup(self.module.model, self.module.lycoris_net)
 
         total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
@@ -910,6 +1243,7 @@ class LoKRTrainer:
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=self.module.device,
+                    param_id_to_name=param_name_lookup,
                 )
                 self._ensure_lokr_device()
                 if checkpoint_info.get("weights_path"):
@@ -948,9 +1282,10 @@ class LoKRTrainer:
                         "checkpoints",
                         f"paused_epoch_{epoch+1}_step_{global_step}",
                     )
-                    extra_state = None
+                    extra_state = {}
                     if training_state is not None and "elapsed_seconds" in training_state:
-                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                        extra_state["elapsed_seconds"] = training_state["elapsed_seconds"]
+                    extra_state["optimizer_state_by_name"] = build_optimizer_state_by_name(optimizer, param_name_lookup)
                     save_lokr_training_checkpoint(
                         self.module.lycoris_net,
                         optimizer,
@@ -980,6 +1315,15 @@ class LoKRTrainer:
                         optimizer,
                         max_norm=self.training_config.max_grad_norm,
                     )
+
+                    nonfinite, total_with_grad, details = _count_nonfinite_grads_detailed(
+                        trainable_params, param_name_lookup
+                    )
+                    if nonfinite:
+                        logger.warning(
+                            f"Detected {nonfinite}/{total_with_grad} non-finite gradients; example: "
+                            + "; ".join(details)
+                        )
 
                     optimizer.step()
                     scheduler.step()
@@ -1020,6 +1364,7 @@ class LoKRTrainer:
                     global_step,
                     checkpoint_dir,
                     lokr_config=self.lokr_config,
+                    extra_state={"optimizer_state_by_name": build_optimizer_state_by_name(optimizer, param_name_lookup)},
                 )
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
 
@@ -1047,11 +1392,19 @@ class LoKRTrainer:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
 
-        optimizer = AdamW(
+        device_type = self.dit_handler.device if isinstance(self.dit_handler.device, str) else self.dit_handler.device.type
+        if device_type == "mps":
+            casted, total = _ensure_trainable_params_fp32(self.module.model)
+            if casted:
+                logger.info(f"Cast {casted}/{total} trainable params to fp32 for MPS stability.")
+
+        optimizer = _select_optimizer(
             trainable_params,
             lr=self.training_config.learning_rate,
             weight_decay=self.training_config.weight_decay,
+            device_type=device_type,
         )
+        param_name_lookup = _build_param_name_lookup(self.module.model, self.module.lycoris_net)
 
         total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
@@ -1078,6 +1431,7 @@ class LoKRTrainer:
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=self.module.device,
+                    param_id_to_name=param_name_lookup,
                 )
                 if checkpoint_info.get("weights_path"):
                     global_step = checkpoint_info.get("global_step", 0)
@@ -1105,9 +1459,10 @@ class LoKRTrainer:
                         "checkpoints",
                         f"paused_epoch_{epoch+1}_step_{global_step}",
                     )
-                    extra_state = None
+                    extra_state = {}
                     if training_state is not None and "elapsed_seconds" in training_state:
-                        extra_state = {"elapsed_seconds": training_state["elapsed_seconds"]}
+                        extra_state["elapsed_seconds"] = training_state["elapsed_seconds"]
+                    extra_state["optimizer_state_by_name"] = build_optimizer_state_by_name(optimizer, param_name_lookup)
                     save_lokr_training_checkpoint(
                         self.module.lycoris_net,
                         optimizer,
@@ -1132,6 +1487,14 @@ class LoKRTrainer:
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(trainable_params, self.training_config.max_grad_norm)
+                    nonfinite, total_with_grad, details = _count_nonfinite_grads_detailed(
+                        trainable_params, param_name_lookup
+                    )
+                    if nonfinite:
+                        logger.warning(
+                            f"Detected {nonfinite}/{total_with_grad} non-finite gradients; example: "
+                            + "; ".join(details)
+                        )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -1160,6 +1523,7 @@ class LoKRTrainer:
                     global_step,
                     checkpoint_dir,
                     lokr_config=self.lokr_config,
+                    extra_state={"optimizer_state_by_name": build_optimizer_state_by_name(optimizer, param_name_lookup)},
                 )
                 yield global_step, avg_epoch_loss, "💾 Checkpoint saved"
 

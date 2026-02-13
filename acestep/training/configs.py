@@ -79,9 +79,7 @@ class TrainingConfig:
     
     Training uses:
     - BFloat16 precision (only supported precision)
-    - Discrete timesteps from turbo shift=3.0 schedule (8 steps)
-    - Randomly samples one of 8 timesteps per training step:
-      [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6429, 0.5, 0.3]
+    - Timesteps are derived from the loaded model config (turbo vs base).
     
     Attributes:
         shift: Timestep shift factor (fixed at 3.0 for turbo model)
@@ -98,9 +96,9 @@ class TrainingConfig:
         seed: Random seed for reproducibility
         output_dir: Directory to save checkpoints and logs
     """
-    # Fixed for turbo model
-    shift: float = 3.0  # Fixed: turbo uses shift=3.0
-    num_inference_steps: int = 8  # Fixed: turbo uses 8 steps
+    # Defaults (overridden based on loaded model config)
+    shift: float = 3.0
+    num_inference_steps: int = 8
     learning_rate: float = 1e-4
     batch_size: int = 1
     gradient_accumulation_steps: int = 4
@@ -126,7 +124,17 @@ class TrainingConfig:
     
     # Logging
     log_every_n_steps: int = 10
-    
+
+    # Side-Step style options
+    use_continuous_timestep: bool = False  # Logit-normal timestep sampling (full denoising range); if False, turbo uses discrete 8-step
+    cfg_dropout_prob: float = 0.15  # Classifier-free guidance: prob of null condition (0 = disabled)
+    log_gradient_norms_every: int = 0  # Log per-parameter gradient norms every N steps for rank/target selection (0 = off)
+
+    # Precomputed grad norms (from preprocess with "Save grad norms")
+    use_grad_norm_target_selection: bool = True  # Use precomputed grad norms to pick top LoRA target modules (fewer params = faster)
+    grad_norm_target_top_k: int = 4  # Number of module types to keep (e.g. q_proj, k_proj, v_proj, o_proj -> 4)
+    use_grad_norm_sample_weighting: bool = True  # Weight batch loss by sample importance from precomputed grad norms
+
     def to_dict(self):
         """Convert to dictionary."""
         return {
@@ -151,4 +159,10 @@ class TrainingConfig:
             "allow_tf32": self.allow_tf32,
             "compile_decoder": self.compile_decoder,
             "log_every_n_steps": self.log_every_n_steps,
+            "use_continuous_timestep": self.use_continuous_timestep,
+            "cfg_dropout_prob": self.cfg_dropout_prob,
+            "log_gradient_norms_every": self.log_gradient_norms_every,
+            "use_grad_norm_target_selection": self.use_grad_norm_target_selection,
+            "grad_norm_target_top_k": self.grad_norm_target_top_k,
+            "use_grad_norm_sample_weighting": self.use_grad_norm_sample_weighting,
         }

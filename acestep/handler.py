@@ -789,16 +789,32 @@ class AceStepHandler:
         }
 
     def unload_aux_models_for_training(self) -> str:
-        """Unload non-DiT models to save memory for LoRA training."""
+        """Unload non-DiT models and offload condition encoder so only the DiT decoder stays on GPU for preprocessed-tensor training."""
         try:
-            self.vae = None
-            self.text_encoder = None
+            if self.vae is not None:
+                try:
+                    self.vae = self.vae.cpu()
+                except Exception:
+                    pass
+                self.vae = None
+            if self.text_encoder is not None:
+                try:
+                    self.text_encoder = self.text_encoder.cpu()
+                except Exception:
+                    pass
+                self.text_encoder = None
             self.text_tokenizer = None
             self.reward_model = None
+            if self.model is not None and hasattr(self.model, "encoder"):
+                try:
+                    self.model.encoder = self.model.encoder.cpu()
+                    logger.info("Offloaded condition encoder to CPU for training (only decoder on GPU)")
+                except Exception as e:
+                    logger.warning(f"Could not offload condition encoder: {e}")
             self._aux_models_unloaded = True
             self._empty_cache()
-            logger.info("Unloaded VAE/text encoder/tokenizer for training")
-            return "✅ Unloaded VAE/text encoder for training"
+            logger.info("Unloaded VAE/text encoder/tokenizer for training; only DiT decoder remains on GPU")
+            return "✅ Unloaded VAE/text encoder; offloaded condition encoder. Only DiT decoder on GPU for training."
         except Exception as e:
             logger.warning(f"Failed to unload aux models: {e}")
             return f"⚠️ Failed to unload aux models: {e}"

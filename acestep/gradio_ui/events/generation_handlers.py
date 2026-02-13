@@ -16,6 +16,7 @@ from acestep.gradio_ui.i18n import t
 from acestep.inference import understand_music, create_sample, format_sample
 from acestep.gpu_config import get_global_gpu_config
 from acestep.model_downloader import ensure_lm_model
+from acestep.audio_utils import read_audio_metadata
 
 
 def clamp_duration_to_gpu_limit(duration_value: Optional[float], llm_handler=None) -> Optional[float]:
@@ -92,6 +93,90 @@ def parse_and_validate_timesteps(
     return timesteps, False, ""
 
 
+def _map_metadata_to_params(metadata: dict, llm_handler=None, filepath: str = ""):
+    """Map metadata dict to generation parameters tuple."""
+    # Extract all fields
+    task_type = metadata.get('task_type', 'text2music')
+    captions = metadata.get('caption', '')
+    lyrics = metadata.get('lyrics', '')
+    vocal_language = metadata.get('vocal_language', 'unknown')
+    
+    # Convert bpm
+    bpm_value = metadata.get('bpm')
+    if bpm_value is not None and bpm_value != "N/A":
+        try:
+            bpm = int(bpm_value) if bpm_value else None
+        except Exception:
+            bpm = None
+    else:
+        bpm = None
+    
+    key_scale = metadata.get('keyscale', '')
+    time_signature = metadata.get('timesignature', '')
+    
+    # Convert duration
+    duration_value = metadata.get('duration', -1)
+    if duration_value is not None and duration_value != "N/A":
+        try:
+            audio_duration = float(duration_value)
+            audio_duration = clamp_duration_to_gpu_limit(audio_duration, llm_handler)
+        except Exception:
+            audio_duration = -1
+    else:
+        audio_duration = -1
+    
+    batch_size = metadata.get('batch_size', 2)
+    inference_steps = metadata.get('inference_steps', 8)
+    guidance_scale = metadata.get('guidance_scale', 7.0)
+    seed = metadata.get('seed', '-1')
+    random_seed = False
+    use_adg = metadata.get('use_adg', False)
+    cfg_interval_start = metadata.get('cfg_interval_start', 0.0)
+    cfg_interval_end = metadata.get('cfg_interval_end', 1.0)
+    audio_format = metadata.get('audio_format', 'mp3')
+    autosave_outputs = metadata.get('autosave_outputs', None)
+    autosave_dir = metadata.get('autosave_dir', None)
+    lm_temperature = metadata.get('lm_temperature', 0.85)
+    lm_cfg_scale = metadata.get('lm_cfg_scale', 2.0)
+    lm_top_k = metadata.get('lm_top_k', 0)
+    lm_top_p = metadata.get('lm_top_p', 0.9)
+    lm_negative_prompt = metadata.get('lm_negative_prompt', 'NO USER INPUT')
+    use_cot_metas = metadata.get('use_cot_metas', True)
+    use_cot_caption = metadata.get('use_cot_caption', True)
+    use_cot_language = metadata.get('use_cot_language', True)
+    audio_cover_strength = metadata.get('audio_cover_strength', 1.0)
+    think = metadata.get('thinking', True)
+    audio_codes = metadata.get('audio_codes', '')
+    repainting_start = metadata.get('repainting_start', 0.0)
+    repainting_end = metadata.get('repainting_end', -1)
+    track_name = metadata.get('track_name')
+    complete_track_classes = metadata.get('complete_track_classes', [])
+    shift = metadata.get('shift', 3.0)
+    infer_method = metadata.get('infer_method', 'ode')
+    custom_timesteps = metadata.get('timesteps', '')
+    if isinstance(custom_timesteps, list):
+        custom_timesteps = ",".join(str(x) for x in custom_timesteps)
+    if custom_timesteps is None:
+        custom_timesteps = ''
+    instrumental = metadata.get('instrumental', False)
+
+    if filepath:
+        gr.Info(t("messages.params_loaded", filename=os.path.basename(filepath)))
+
+    return (
+        task_type, captions, lyrics, vocal_language, bpm, key_scale, time_signature,
+        audio_duration, batch_size, inference_steps, guidance_scale, seed, random_seed,
+        use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method,
+        custom_timesteps,
+        audio_format, autosave_outputs, autosave_dir,
+        lm_temperature, autosave_outputs, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
+        use_cot_metas, use_cot_caption, use_cot_language, audio_cover_strength,
+        think, audio_codes, repainting_start, repainting_end,
+        track_name, complete_track_classes, instrumental,
+        True
+    )
+
+
 def load_metadata(file_obj, llm_handler=None):
     """Load generation parameters from a JSON file
     
@@ -101,7 +186,7 @@ def load_metadata(file_obj, llm_handler=None):
     """
     if file_obj is None:
         gr.Warning(t("messages.no_file_selected"))
-        return [None] * 36 + [False]  # Return None for all fields, False for is_format_caption
+        return [None] * 39 + [False]  # Return None for all fields, False for is_format_caption
     
     try:
         # Read the uploaded file
@@ -113,88 +198,46 @@ def load_metadata(file_obj, llm_handler=None):
         with open(filepath, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
         
-        # Extract all fields
-        task_type = metadata.get('task_type', 'text2music')
-        captions = metadata.get('caption', '')
-        lyrics = metadata.get('lyrics', '')
-        vocal_language = metadata.get('vocal_language', 'unknown')
-        
-        # Convert bpm
-        bpm_value = metadata.get('bpm')
-        if bpm_value is not None and bpm_value != "N/A":
-            try:
-                bpm = int(bpm_value) if bpm_value else None
-            except:
-                bpm = None
-        else:
-            bpm = None
-        
-        key_scale = metadata.get('keyscale', '')
-        time_signature = metadata.get('timesignature', '')
-        
-        # Convert duration
-        duration_value = metadata.get('duration', -1)
-        if duration_value is not None and duration_value != "N/A":
-            try:
-                audio_duration = float(duration_value)
-                # Clamp duration to GPU memory limit
-                audio_duration = clamp_duration_to_gpu_limit(audio_duration, llm_handler)
-            except:
-                audio_duration = -1
-        else:
-            audio_duration = -1
-        
-        batch_size = metadata.get('batch_size', 2)
-        inference_steps = metadata.get('inference_steps', 8)
-        guidance_scale = metadata.get('guidance_scale', 7.0)
-        seed = metadata.get('seed', '-1')
-        random_seed = False  # Always set to False when loading to enable reproducibility with saved seed
-        use_adg = metadata.get('use_adg', False)
-        cfg_interval_start = metadata.get('cfg_interval_start', 0.0)
-        cfg_interval_end = metadata.get('cfg_interval_end', 1.0)
-        audio_format = metadata.get('audio_format', 'mp3')
-        lm_temperature = metadata.get('lm_temperature', 0.85)
-        lm_cfg_scale = metadata.get('lm_cfg_scale', 2.0)
-        lm_top_k = metadata.get('lm_top_k', 0)
-        lm_top_p = metadata.get('lm_top_p', 0.9)
-        lm_negative_prompt = metadata.get('lm_negative_prompt', 'NO USER INPUT')
-        use_cot_metas = metadata.get('use_cot_metas', True)  # Added: read use_cot_metas
-        use_cot_caption = metadata.get('use_cot_caption', True)
-        use_cot_language = metadata.get('use_cot_language', True)
-        audio_cover_strength = metadata.get('audio_cover_strength', 1.0)
-        think = metadata.get('thinking', True)  # Fixed: read 'thinking' not 'think'
-        audio_codes = metadata.get('audio_codes', '')
-        repainting_start = metadata.get('repainting_start', 0.0)
-        repainting_end = metadata.get('repainting_end', -1)
-        track_name = metadata.get('track_name')
-        complete_track_classes = metadata.get('complete_track_classes', [])
-        shift = metadata.get('shift', 3.0)  # Default 3.0 for base models
-        infer_method = metadata.get('infer_method', 'ode')  # Default 'ode' for diffusion inference
-        custom_timesteps = metadata.get('timesteps', '')  # Custom timesteps (stored as 'timesteps' in JSON)
-        if custom_timesteps is None:
-            custom_timesteps = ''
-        instrumental = metadata.get('instrumental', False)  # Added: read instrumental
-        
-        gr.Info(t("messages.params_loaded", filename=os.path.basename(filepath)))
-        
-        return (
-            task_type, captions, lyrics, vocal_language, bpm, key_scale, time_signature,
-            audio_duration, batch_size, inference_steps, guidance_scale, seed, random_seed,
-            use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method,
-            custom_timesteps,  # Added: custom_timesteps (between infer_method and audio_format)
-            audio_format, lm_temperature, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
-            use_cot_metas, use_cot_caption, use_cot_language, audio_cover_strength,
-            think, audio_codes, repainting_start, repainting_end,
-            track_name, complete_track_classes, instrumental,
-            True  # Set is_format_caption to True when loading from file
-        )
+        return _map_metadata_to_params(metadata, llm_handler, filepath)
         
     except json.JSONDecodeError as e:
         gr.Warning(t("messages.invalid_json", error=str(e)))
-        return [None] * 36 + [False]
+        return [None] * 39 + [False]
     except Exception as e:
         gr.Warning(t("messages.load_error", error=str(e)))
-        return [None] * 36 + [False]
+        return [None] * 39 + [False]
+
+
+def view_audio_metadata(file_obj):
+    """View embedded metadata from an audio file."""
+    if file_obj is None:
+        gr.Warning(t("messages.no_file_selected"))
+        return ""
+    filepath = file_obj.name if hasattr(file_obj, 'name') else file_obj
+    meta = read_audio_metadata(filepath)
+    if not meta:
+        gr.Warning(t("messages.no_metadata_found"))
+        return ""
+    return json.dumps(meta, indent=2, ensure_ascii=False)
+
+
+def load_params_from_audio(file_obj, llm_handler=None):
+    """Load generation parameters from embedded audio metadata."""
+    if file_obj is None:
+        gr.Warning(t("messages.no_file_selected"))
+        return [""] + [None] * 39 + [False]
+    filepath = file_obj.name if hasattr(file_obj, 'name') else file_obj
+    meta = read_audio_metadata(filepath)
+    if not meta:
+        gr.Warning(t("messages.no_metadata_found"))
+        return [""] + [None] * 39 + [False]
+    parsed = meta.get("parsed") if isinstance(meta, dict) else None
+    if not isinstance(parsed, dict):
+        gr.Warning(t("messages.no_metadata_found"))
+        return [json.dumps(meta, indent=2, ensure_ascii=False)] + [None] * 39 + [False]
+    mapped = _map_metadata_to_params(parsed, llm_handler, filepath)
+    display = json.dumps(meta, indent=2, ensure_ascii=False)
+    return (display,) + mapped
 
 
 def load_random_example(task_type: str, llm_handler=None):

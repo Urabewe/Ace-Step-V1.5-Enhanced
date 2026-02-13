@@ -549,6 +549,32 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
                     value="",
                     info=t("generation.custom_timesteps_info"),
                 )
+
+            # Metadata tools (advanced, unobtrusive)
+            gr.HTML(f"<h4>{t('generation.metadata_tools_title')}</h4>")
+            with gr.Row():
+                metadata_audio = gr.Audio(
+                    label=t("generation.metadata_audio_label"),
+                    type="filepath",
+                )
+            with gr.Row():
+                view_metadata_btn = gr.Button(
+                    t("generation.view_metadata_btn"),
+                    variant="secondary",
+                    size="sm",
+                )
+                load_metadata_btn = gr.Button(
+                    t("generation.load_metadata_btn"),
+                    variant="secondary",
+                    size="sm",
+                )
+            with gr.Row():
+                metadata_display = gr.Textbox(
+                    label=t("generation.metadata_display_label"),
+                    value="",
+                    lines=6,
+                    interactive=False,
+                )
             
             with gr.Row():
                 cfg_interval_start = gr.Slider(
@@ -808,6 +834,10 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
         "shift": shift,
         "infer_method": infer_method,
         "custom_timesteps": custom_timesteps,
+        "metadata_audio": metadata_audio,
+        "view_metadata_btn": view_metadata_btn,
+        "load_metadata_btn": load_metadata_btn,
+        "metadata_display": metadata_display,
         "audio_format": audio_format,
         "autosave_outputs": autosave_outputs,
         "autosave_dir": autosave_dir,

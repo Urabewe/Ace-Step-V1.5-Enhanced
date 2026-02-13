@@ -363,6 +363,62 @@ def generate_uuid_from_audio_data(
     return data_hash
 
 
+def read_audio_metadata(audio_path: Union[str, Path]) -> Dict[str, Any]:
+    """Read embedded audio metadata (best-effort).
+
+    Returns a dict with raw tags and, when present, parsed AceStep metadata
+    stored in the `comment` tag as JSON.
+    """
+    audio_path = str(audio_path) if audio_path is not None else ""
+    if not audio_path or not os.path.exists(audio_path):
+        return {}
+
+    result: Dict[str, Any] = {"file_path": audio_path}
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        return result
+
+    try:
+        cmd = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags",
+            "-of",
+            "json",
+            audio_path,
+        ]
+        completed = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+        tags = payload.get("format", {}).get("tags", {}) or {}
+        result["tags"] = tags
+
+        comment_val = (
+            tags.get("comment")
+            or tags.get("COMMENT")
+            or tags.get("description")
+            or tags.get("DESCRIPTION")
+        )
+        if isinstance(comment_val, str):
+            comment_val = comment_val.strip()
+            if comment_val.startswith("{") and comment_val.endswith("}"):
+                try:
+                    result["parsed"] = json.loads(comment_val)
+                except Exception:
+                    result["parsed_error"] = "Failed to parse comment JSON"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 # Global default instance
 _default_saver = AudioSaver(default_format="flac")
 

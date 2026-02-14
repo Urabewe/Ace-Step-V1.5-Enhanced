@@ -36,6 +36,7 @@ lycoris-lora>=0.1.8
 lightning>=2.0.0
 tensorboard>=2.0.0
 tensorboardX>=2.0.0
+bitsandbytes
 
 # nano-vllm dependencies
 triton-windows>=3.0.0,<3.4; sys_platform == 'win32'
